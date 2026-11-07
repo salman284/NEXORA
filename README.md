@@ -104,4 +104,3 @@ $env:NEXORA_ACCESS_TOKEN = "<worker-session-token>"
 - [Architecture](docs/architecture.md)
 - [Phase 1 audit](docs/phase-1-audit.md)
 - [Data model and API](docs/data-model-and-api.md)
-"# NEXORA" 
