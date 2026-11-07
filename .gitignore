@@ -1,0 +1,7 @@
+artifacts/
+__pycache__/
+.venv/
+backend/.venv/
+worker-agent/.venv/
+frontend/node_modules/
+*.pyc
