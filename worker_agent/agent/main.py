@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--node-id", default=os.getenv("NEXORA_NODE_ID"))
     parser.add_argument("--pairing-code", default=os.getenv("NEXORA_PAIRING_CODE"))
     parser.add_argument("--token", default=os.getenv("NEXORA_ACCESS_TOKEN"))
+    parser.add_argument("--node-name", default=os.getenv("NEXORA_NODE_NAME"), help="Custom display name for this Worker node")
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--execution-timeout", type=float, default=30.0)
     parser.add_argument("--once", action="store_true", help="Run one heartbeat/lease cycle and exit")
@@ -88,15 +89,41 @@ def main() -> None:
         raise SystemExit("--token (or NEXORA_ACCESS_TOKEN) is required")
     client = MasterClient(args.master_url, args.token)
     node_id = args.node_id
-    if not node_id and args.pairing_code:
-        inventory = collect_inventory()
-        paired = client.request_pairing(inventory_pairing_payload(args.pairing_code, inventory))
-        node_id = paired["id"]
-        print(f"Pairing request submitted. Node ID: {node_id}")
-        print("A Master must approve this node before heartbeats and task leases are accepted.")
-        return
     if not node_id:
-        raise SystemExit("--node-id or --pairing-code is required")
+        inventory = collect_inventory()
+        payload = inventory_pairing_payload(args.pairing_code or "", inventory)
+        if args.node_name:
+            payload["node_name"] = args.node_name
+            payload["hostname"] = args.node_name
+        paired = client.request_pairing(payload)
+        node_id = paired["id"]
+        print("")
+        print("=============================================================")
+        print("  NEXORA Distributed Worker Agent — Join Request Sent")
+        print("=============================================================")
+        print(f"  Master URL : {args.master_url}")
+        print(f"  Node ID    : {node_id}")
+        print(f"  Node Name  : {payload['node_name']}")
+        print(f"  Status     : PENDING (Waiting for Master approval)")
+        print("=============================================================")
+        print("⏳ Waiting for Master to accept/approve in the Dashboard...", flush=True)
+
+        # Poll until Master approves this node in Dashboard
+        while True:
+            time.sleep(2.5)
+            try:
+                client.heartbeat(node_id, metrics=collect_metrics())
+                print("\n🎉 Master accepted the request! Node is now APPROVED.")
+                print("🚀 Connected to GPU cluster. Listening for computational tasks...\n", flush=True)
+                break
+            except MasterApiError as err:
+                if "not approved" in str(err).lower() or err.status_code == 403:
+                    print(".", end="", flush=True)
+                else:
+                    print(f"\n[Status check: {err}]", flush=True)
+            except Exception as ex:
+                print(f"\n[Connection: {ex}]", flush=True)
+
     agent = WorkerAgent(AgentConfig(args.master_url, node_id, args.token, args.interval, args.execution_timeout), client)
     if args.once:
         agent.run_once()

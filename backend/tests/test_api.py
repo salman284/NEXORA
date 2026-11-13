@@ -164,6 +164,69 @@ def test_pairing_requires_approval_before_heartbeat(client: TestClient):
     assert client.post(f"/api/v1/clusters/{cluster['id']}/pairing-codes", headers=master_headers).json()["code"]
 
 
+def test_open_worker_join_request_without_pairing_code(client: TestClient):
+    master = client.post(
+        "/api/v1/auth/register",
+        json={
+            "full_name": "Admin Master",
+            "username": "admin-open",
+            "email": "admin-open@example.com",
+            "password": "master password long enough",
+            "roles": ["master"],
+        },
+    ).json()
+    worker = client.post(
+        "/api/v1/auth/register",
+        json={
+            "full_name": "Souvik Worker",
+            "username": "souvik-open",
+            "email": "souvik-open@example.com",
+            "password": "worker password long enough",
+            "roles": ["worker_operator"],
+        },
+    ).json()
+    master_headers = {"Authorization": f"Bearer {master['access_token']}"}
+    worker_headers = {"Authorization": f"Bearer {worker['access_token']}"}
+
+    cluster = client.post("/api/v1/clusters", headers=master_headers, json={"name": "Open Mesh Cluster"}).json()
+
+    # Worker requests to join without any pairing code
+    join_req = client.post(
+        "/api/v1/pairing/requests",
+        headers=worker_headers,
+        json={
+            "node_name": "Souvik-GPU-Rig",
+            "hostname": "souvik-pc",
+            "operating_system": "Windows 11",
+            "private_ipv4": "10.229.205.150",
+            "gpu_model": "NVIDIA GeForce RTX 3060",
+            "gpu_vram_bytes": 12_000_000_000,
+            "compute_backend": "cuda",
+        },
+    )
+    assert join_req.status_code == 201
+    node_id = join_req.json()["id"]
+    assert join_req.json()["membership_status"] == "pending"
+
+    # Blocked before approval
+    assert client.post(f"/api/v1/worker/nodes/{node_id}/heartbeat", headers=worker_headers, json={}).status_code == 403
+
+    # Master accepts / approves the join request
+    approved = client.post(f"/api/v1/clusters/{cluster['id']}/members/{node_id}/approve", headers=master_headers)
+    assert approved.status_code == 200
+    assert approved.json()["membership_status"] == "approved"
+
+    # Worker heartbeat now succeeds
+    hb = client.post(
+        f"/api/v1/worker/nodes/{node_id}/heartbeat",
+        headers=worker_headers,
+        json={"gpu_utilization": 15.0, "status": "online"},
+    )
+    assert hb.status_code == 200
+    assert hb.json()["status"] == "online"
+
+
+
 def test_task_parallel_job_lease_and_result_lifecycle(client: TestClient):
     master = client.post(
         "/api/v1/auth/register",

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, Cpu, Database, Download, FileText, FileUp, LogOut, Network, Plus, RefreshCw, Settings, ShieldCheck, Wifi, Zap } from "lucide-react";
+import { Activity, Check, Copy, Cpu, Database, Download, FileText, FileUp, LogOut, Network, Plus, RefreshCw, Settings, ShieldCheck, Wifi, Zap } from "lucide-react";
 
 type User = { full_name: string; username: string; email: string; roles: string[] };
 type Cluster = { id: string; name: string; status: string; created_at: string };
@@ -180,6 +180,80 @@ function NodeOverview({ nodes, summary, telemetry, jobs, clusters, selectedId, c
           <button className="icon-button" title="Refresh nodes" onClick={onRefresh}><RefreshCw size={17} /></button>
         </div>
       </div>
+
+      {nodes.filter((n) => n.membership_status === "pending").length > 0 && (
+        <section style={{
+          background: "linear-gradient(135deg, rgba(211, 243, 107, 0.15), rgba(120, 200, 50, 0.05))",
+          border: "1px solid #d3f36b",
+          borderRadius: "12px",
+          padding: "16px 20px",
+          marginBottom: "20px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "12px"
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <span style={{ fontSize: "22px" }}>🔔</span>
+            <div>
+              <strong style={{ color: "#d3f36b", fontSize: "16px" }}>
+                {nodes.filter((n) => n.membership_status === "pending").length} Worker Join Request(s) Waiting for Approval
+              </strong>
+              <p style={{ margin: 0, fontSize: "13px", color: "#bbb" }}>
+                Machines on your LAN want to contribute their GPUs to this cluster. Click Accept to authorize.
+              </p>
+            </div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            {nodes.filter((n) => n.membership_status === "pending").map((pNode) => (
+              <div key={pNode.id} style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                background: "rgba(0,0,0,0.5)",
+                padding: "10px 14px",
+                borderRadius: "8px",
+                border: "1px solid rgba(255,255,255,0.08)"
+              }}>
+                <div>
+                  <strong style={{ fontSize: "15px", color: "#fff" }}>{pNode.node_name}</strong>
+                  <span style={{ color: "#aaa", fontSize: "13px", marginLeft: "10px" }}>
+                    {pNode.hostname} · {pNode.private_ipv4 ?? "LAN"} · GPU: {pNode.gpu_model ?? "CPU Mode"} ({pNode.compute_backend ?? "cpu"})
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <button
+                    onClick={() => onApprove(pNode.id)}
+                    style={{
+                      background: "#d3f36b",
+                      color: "#111",
+                      border: "none",
+                      borderRadius: "6px",
+                      padding: "7px 14px",
+                      fontWeight: 700,
+                      cursor: "pointer"
+                    }}
+                  >
+                    ✅ Accept Worker
+                  </button>
+                  <button
+                    onClick={() => onRevoke(pNode.id)}
+                    style={{
+                      background: "transparent",
+                      color: "#ff6b6b",
+                      border: "1px solid rgba(255,107,107,0.3)",
+                      borderRadius: "6px",
+                      padding: "7px 12px",
+                      cursor: "pointer"
+                    }}
+                  >
+                    Reject
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       <section className="node-grid">
         {nodes.length === 0 ? (
@@ -494,8 +568,10 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
 
 function WorkerConsoleView({ token, onError }: { token: string; onError: (message: string) => void }) {
   const [myNodes, setMyNodes] = useState<Node[]>([]);
-  const [pairingCode, setPairingCode] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [masterHost, setMasterHost] = useState(typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1" ? window.location.hostname : "10.229.205.230");
+  const [pairingCode, setPairingCode] = useState("5A0C1B8F");
+  const [nodeName, setNodeName] = useState("Souvik-PC");
+  const [copied, setCopied] = useState(false);
   const headers = { Authorization: `Bearer ${token}` };
 
   async function loadMyNodes() {
@@ -522,13 +598,34 @@ function WorkerConsoleView({ token, onError }: { token: string; onError: (messag
     }
   }
 
+  const psCommand = `$env:NEXORA_MASTER_URL = "http://${masterHost}:5000"\n$env:NEXORA_ACCESS_TOKEN = "${token}"\n.\\scripts\\start-worker.ps1 -PairingCode "${pairingCode.trim()}" -NodeName "${nodeName.trim()}"`;
+
+  function copyCommand() {
+    navigator.clipboard.writeText(psCommand);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2500);
+  }
+
+  function downloadBat() {
+    const batContent = `@echo off\r\ncd /d "%~dp0"\r\necho Starting NEXORA Worker Node: ${nodeName}...\r\nset NEXORA_MASTER_URL=http://${masterHost}:5000\r\nset NEXORA_ACCESS_TOKEN=${token}\r\npowershell -ExecutionPolicy Bypass -File .\\scripts\\start-worker.ps1 -MasterUrl "http://${masterHost}:5000" -PairingCode "${pairingCode.trim()}" -NodeName "${nodeName.trim()}"\r\npause\r\n`;
+    const blob = new Blob([batContent], { type: "application/x-bat" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `connect-${nodeName.toLowerCase().replace(/[^a-z0-9]/g, "-") || "worker"}.bat`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <section className="worker-console-view">
       <section className="hero-strip compact-hero">
         <div>
           <span className="eyebrow">Worker operator</span>
           <h2>Local Compute Station</h2>
-          <p>Manage your computer's GPU/CPU contribution to the cluster and disconnect safely.</p>
+          <p>Register your PC and contribute your GPU/CPU power to the NEXORA cluster.</p>
         </div>
         <Cpu size={42} className="hero-accent" />
       </section>
@@ -536,15 +633,56 @@ function WorkerConsoleView({ token, onError }: { token: string; onError: (messag
       <section className="worker-action-card">
         <div className="card-title">
           <Wifi size={18} />
-          <div><span className="eyebrow">Agent Startup & Pairing</span><h2>Start Worker Agent CLI</h2></div>
+          <div><span className="eyebrow">Quick Connect Station</span><h2>Pair This Computer as a Worker</h2></div>
         </div>
-        <p className="muted">To register and pair this computer as an active Worker, run the following in PowerShell:</p>
+        <p className="muted">Enter the details below to generate a 1-click startup script or copy the ready-to-run command:</p>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "12px", margin: "16px 0" }}>
+          <label style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "13px" }}>
+            <span style={{ fontWeight: 600 }}>Master IP Address</span>
+            <input
+              type="text"
+              value={masterHost}
+              onChange={(e) => setMasterHost(e.target.value)}
+              placeholder="10.229.205.230"
+              style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid #333", background: "#111", color: "#fff" }}
+            />
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "13px" }}>
+            <span style={{ fontWeight: 600 }}>Pairing Code</span>
+            <input
+              type="text"
+              value={pairingCode}
+              onChange={(e) => setPairingCode(e.target.value)}
+              placeholder="e.g. 5A0C1B8F"
+              style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid #333", background: "#111", color: "#fff" }}
+            />
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "13px" }}>
+            <span style={{ fontWeight: 600 }}>Worker Node Name</span>
+            <input
+              type="text"
+              value={nodeName}
+              onChange={(e) => setNodeName(e.target.value)}
+              placeholder="e.g. Souvik-PC"
+              style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid #333", background: "#111", color: "#fff" }}
+            />
+          </label>
+        </div>
+
+        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", marginBottom: "16px" }}>
+          <button className="primary-button" onClick={downloadBat} type="button" style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
+            <Download size={16} /> Download 1-Click connect.bat
+          </button>
+          <button className="secondary-button" onClick={copyCommand} type="button" style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
+            {copied ? <Check size={16} color="#d3f36b" /> : <Copy size={16} />}
+            {copied ? "Copied to Clipboard!" : "Copy PowerShell Command"}
+          </button>
+        </div>
+
         <div className="allocation-box">
-          <code>
-            $env:NEXORA_MASTER_URL = "http://127.0.0.1:5000"<br />
-            $env:NEXORA_ACCESS_TOKEN = "{token.slice(0, 16)}..."<br />
-            .\scripts\start-worker.ps1 -PairingCode "&lt;pairing-code-from-master&gt;"
-          </code>
+          <small style={{ color: "#888", display: "block", marginBottom: "6px" }}>Preview Command:</small>
+          <code>{psCommand}</code>
         </div>
       </section>
 
@@ -557,7 +695,7 @@ function WorkerConsoleView({ token, onError }: { token: string; onError: (messag
         <div className="empty-state">
           <Cpu size={24} />
           <strong>No Worker Nodes registered under this account</strong>
-          <p>Obtain a pairing code from the Master, run `start-worker.ps1`, and your machine will appear here.</p>
+          <p>Download the <code>connect.bat</code> above and run it on this PC. Your machine will appear here and in the Master's cluster.</p>
         </div>
       ) : (
         <div className="node-grid">
