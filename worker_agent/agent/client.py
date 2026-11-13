@@ -25,7 +25,7 @@ class MasterClient:
             method=method,
             headers={
                 "Accept": "application/json",
-                "Authorization": f"Bearer {self.access_token}",
+                "Authorization": "Bearer " + self.access_token,
                 "Content-Type": "application/json",
             },
         )
