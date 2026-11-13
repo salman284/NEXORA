@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     workload_id TEXT REFERENCES workload_packages(id) ON DELETE SET NULL,
     name TEXT NOT NULL,
     execution_mode TEXT NOT NULL CHECK (execution_mode = 'task_parallel'),
+    scheduling_policy TEXT NOT NULL DEFAULT 'automatic' CHECK (scheduling_policy IN ('automatic', 'manual', 'hybrid')),
+    scheduling_config_json TEXT NOT NULL DEFAULT '{}',
     priority INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'paused', 'completed', 'failed', 'canceled')),
     retry_limit INTEGER NOT NULL DEFAULT 2,
@@ -113,9 +115,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'leased', 'running', 'succeeded', 'failed', 'retrying', 'canceled', 'timed_out')),
     attempt INTEGER NOT NULL DEFAULT 0,
     assigned_node_id TEXT REFERENCES nodes(id) ON DELETE SET NULL,
+    pinned_node_id TEXT REFERENCES nodes(id) ON DELETE SET NULL,
     lease_token_hash TEXT,
     lease_expires_at TEXT,
     next_retry_at TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    duration_seconds REAL,
     result_json TEXT,
     result_hash TEXT,
     error TEXT,
@@ -206,6 +212,24 @@ def connection_scope() -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+def _ensure_column(connection: sqlite3.Connection, table: str, column_def: str) -> None:
+    column_name = column_def.split()[0]
+    cursor = connection.execute(f"PRAGMA table_info({table})")
+    existing = [row["name"] for row in cursor.fetchall()]
+    if column_name not in existing:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+
+
 def initialize_database() -> None:
     with connection_scope() as connection:
         connection.executescript(SCHEMA)
+        _ensure_column(connection, "jobs", "priority INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "jobs", "retry_limit INTEGER NOT NULL DEFAULT 2")
+        _ensure_column(connection, "jobs", "lease_seconds INTEGER NOT NULL DEFAULT 60")
+        _ensure_column(connection, "jobs", "scheduling_policy TEXT NOT NULL DEFAULT 'automatic'")
+        _ensure_column(connection, "jobs", "scheduling_config_json TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(connection, "tasks", "next_retry_at TEXT")
+        _ensure_column(connection, "tasks", "pinned_node_id TEXT REFERENCES nodes(id) ON DELETE SET NULL")
+        _ensure_column(connection, "tasks", "started_at TEXT")
+        _ensure_column(connection, "tasks", "completed_at TEXT")
+        _ensure_column(connection, "tasks", "duration_seconds REAL")

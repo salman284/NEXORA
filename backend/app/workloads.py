@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field, model_validator
 
 
-SUPPORTED_OPERATIONS = {"identity", "square", "sum"}
+SUPPORTED_OPERATIONS = {"identity", "square", "sum", "matmul"}
 
 
 class WorkloadManifest(BaseModel):
@@ -18,7 +18,7 @@ class WorkloadManifest(BaseModel):
     runtime: str = Field(pattern=r"^builtin$")
     backend: str = Field(default="cpu", pattern=r"^(cpu|opencl)$")
     execution_mode: str = Field(pattern=r"^task_parallel$")
-    operation: str = Field(pattern=r"^(identity|square|sum)$")
+    operation: str = Field(pattern=r"^(identity|square|sum|matmul)$")
     aggregation: str = Field(pattern=r"^collect$")
     output_format: str = Field(default="json", pattern=r"^json$")
     required_gpu_memory_bytes: int = Field(default=0, ge=0)

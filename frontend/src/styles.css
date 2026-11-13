@@ -86,8 +86,46 @@ textarea:focus { border-color: #b9dc62; }
 @media (max-width: 800px) { .audit-row { grid-template-columns: 30px 1fr auto; } .audit-row code, .audit-row time { grid-column: 2 / -1; } }
 @media (max-width: 800px) { .network-columns { grid-template-columns: 1fr; } .diagnostic-stats { grid-template-columns: 1fr; } }
 .task-table { overflow: auto; border: 1px solid #29362d; border-radius: 9px; }
-.task-row { display: grid; grid-template-columns: 1fr 110px 100px 1.3fr 1.5fr; gap: 14px; align-items: center; min-width: 720px; padding: 13px 15px; border-bottom: 1px solid #29362d; color: #9baa9d; font: 10px 'DM Mono', monospace; }
+.task-row { display: grid; grid-template-columns: 1.2fr 90px 70px 1.2fr 80px 1.5fr; gap: 14px; align-items: center; min-width: 780px; padding: 13px 15px; border-bottom: 1px solid #29362d; color: #9baa9d; font: 10px 'DM Mono', monospace; }
 .task-row:last-child { border-bottom: 0; }
 .task-row > span:first-child { color: #edf4ed; }
+
+/* Visual Topology */
+.topology-panel { margin-top: 32px; padding: 24px; border: 1px solid #29362d; border-radius: 10px; background: #151c18; }
+.topology-container { margin-top: 24px; display: flex; flex-direction: column; gap: 20px; }
+.topology-node { display: flex; align-items: center; gap: 14px; padding: 16px 20px; border-radius: 9px; background: #1b251e; border: 1px solid #2e3a32; }
+.topology-node.master-box { background: linear-gradient(90deg, #1d2d21, #16221a); border-color: #55724e; }
+.topology-node strong { display: block; font-size: 14px; color: #ecf5eb; }
+.topology-node span { display: block; margin-top: 4px; font: 10px 'DM Mono', monospace; color: #829083; }
+.topology-tree { display: grid; gap: 12px; margin-left: 28px; padding-left: 20px; border-left: 2px dashed #3a4b3d; }
+.topology-branch { position: relative; }
+.topology-branch .topology-line { position: absolute; left: -20px; top: 50%; width: 20px; height: 2px; border-top: 2px dashed #3a4b3d; }
+.topology-node.worker-box { flex-wrap: wrap; justify-content: space-between; }
+.topology-node.worker-box.offline { opacity: .65; border-style: dashed; }
+.worker-info small { display: block; margin-top: 4px; color: #a4b497; font: 10px 'DM Mono', monospace; }
+.worker-status-badge { display: flex; align-items: center; gap: 10px; }
+.task-pill { padding: 4px 8px; border-radius: 4px; background: #273729; color: #b7ce9e; font: 9px 'DM Mono', monospace; }
+.topology-empty { padding: 20px; color: #829083; font-size: 12px; font-style: italic; }
+
+/* Scheduler Allocation */
+.allocation-box { margin-top: 10px; padding: 14px; border: 1px solid #2e3a32; border-radius: 8px; background: #111714; display: grid; gap: 10px; }
+.allocation-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.allocation-item span { font: 11px 'DM Mono', monospace; color: #bac6bb; }
+.allocation-item input { width: 100px; min-height: 34px; padding: 0 8px; font-size: 12px; }
+
+/* Report and Control Buttons */
+.report-btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
+.secondary-button { border: 1px solid #3d4f40; border-radius: 8px; background: #1b251e; color: #c4d4c5; font: 600 11px 'DM Mono', monospace; padding: 8px 12px; }
+.secondary-button:hover { background: #25342a; color: #d3f36b; border-color: #637f5a; }
+
+/* Worker Console View */
+.worker-console-view { display: grid; gap: 24px; }
+.worker-action-card { padding: 20px; border: 1px solid #29362d; border-radius: 10px; background: #151c18; }
+.worker-node-item { display: flex; align-items: center; justify-content: space-between; padding: 14px; border: 1px solid #29362d; border-radius: 8px; background: #1b251e; margin-top: 10px; }
+.drain-btn { border: 1px solid #8d6232; border-radius: 6px; padding: 6px 12px; background: transparent; color: #f5b771; font: 700 10px 'DM Mono', monospace; }
+.drain-btn:hover { background: #3d2c18; }
+
+.vram-capacity-note { display: block; font: 9px 'DM Mono', monospace; color: #728474; margin-top: 4px; }
+
 @media (max-width: 800px) { .login-shell { grid-template-columns: 1fr; } .login-aside { display: none; } .sidebar { width: 68px; padding-inline: 10px; } .logo { justify-content: center; margin-inline: 0 0 50px; } .logo strong, .side-label, .nav-item:not(.active)::after, .nav-item small, .nav-item { font-size: 0; } .nav-item { justify-content: center; padding: 12px 0; } .nav-item svg { width: 19px; height: 19px; } .sidebar-foot { display: block; } .user-chip { justify-content: center; } .user-chip > div:not(.avatar), .sidebar-foot .icon-button { display: none; } .content { padding: 24px 18px 50px; } .hero-strip { padding: 26px; } .hero-orbit { transform: scale(.75); margin-right: -24px; } .metrics-grid { grid-template-columns: repeat(2, 1fr); } .topbar { align-items: flex-start; } .top-actions { flex-direction: column-reverse; gap: 10px; } }
 @media (max-width: 800px) { .workload-columns { grid-template-columns: 1fr; } .job-row { grid-template-columns: 1fr; gap: 12px; } .job-state { width: max-content; } }

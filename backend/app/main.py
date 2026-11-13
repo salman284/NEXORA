@@ -193,6 +193,7 @@ class NetworkPreflightRequest(BaseModel):
 class TaskInput(BaseModel):
     task_key: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.:-]+$")
     payload: dict[str, Any]
+    pinned_node_id: str | None = None
 
 
 class JobCreateRequest(BaseModel):
@@ -200,6 +201,8 @@ class JobCreateRequest(BaseModel):
     workload_id: str | None = None
     name: str = Field(min_length=1, max_length=160)
     execution_mode: str = Field(default="task_parallel", pattern=r"^task_parallel$")
+    scheduling_policy: str = Field(default="automatic", pattern=r"^(automatic|manual|hybrid)$")
+    scheduling_config: dict[str, Any] = Field(default_factory=dict)
     priority: int = Field(default=0, ge=-10, le=100)
     tasks: list[TaskInput] = Field(min_length=1, max_length=MAX_TASKS_PER_JOB)
     retry_limit: int = Field(default=2, ge=0, le=10)
@@ -212,6 +215,8 @@ class JobResponse(BaseModel):
     workload_id: str | None
     name: str
     execution_mode: str
+    scheduling_policy: str = "automatic"
+    scheduling_config: dict[str, Any] = Field(default_factory=dict)
     priority: int
     state: str
     retry_limit: int
@@ -232,11 +237,68 @@ class TaskResponse(BaseModel):
     state: str
     attempt: int
     assigned_node_id: str | None
+    pinned_node_id: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    duration_seconds: float | None = None
     lease_expires_at: datetime | None
     next_retry_at: datetime | None
     result: dict[str, Any] | None
     result_hash: str | None
     error: str | None
+
+
+class TaskReportItem(BaseModel):
+    task_key: str
+    state: str
+    attempt: int
+    assigned_node_id: str | None
+    node_name: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    duration_seconds: float | None = None
+    error: str | None = None
+
+
+class NodePerformanceSummary(BaseModel):
+    node_id: str
+    node_name: str
+    tasks_completed: int
+    tasks_failed: int
+    total_compute_seconds: float
+    avg_task_duration_seconds: float
+
+
+class JobReportResponse(BaseModel):
+    job_id: str
+    job_name: str
+    cluster_id: str
+    state: str
+    execution_mode: str
+    scheduling_policy: str
+    priority: int
+    task_count: int
+    succeeded_count: int
+    failed_count: int
+    total_duration_seconds: float | None
+    created_at: datetime
+    updated_at: datetime
+    nodes: list[NodePerformanceSummary]
+    tasks: list[TaskReportItem]
+
+
+class ClusterSummaryResponse(BaseModel):
+    cluster_id: str
+    cluster_name: str
+    registered_nodes: int
+    online_nodes: int
+    offline_nodes: int
+    detected_gpus: int
+    total_vram_bytes: int
+    active_jobs: int
+    queued_jobs: int
+    completed_jobs: int
+    failed_jobs: int
 
 
 class TaskLeaseResponse(BaseModel):
@@ -700,6 +762,7 @@ def json_hash(value: Any) -> str:
 
 
 def task_response(row) -> TaskResponse:
+    row_keys = row.keys() if hasattr(row, "keys") else []
     return TaskResponse(
         id=row["id"],
         job_id=row["job_id"],
@@ -708,6 +771,10 @@ def task_response(row) -> TaskResponse:
         state=row["state"],
         attempt=row["attempt"],
         assigned_node_id=row["assigned_node_id"],
+        pinned_node_id=row["pinned_node_id"] if "pinned_node_id" in row_keys else None,
+        started_at=datetime.fromisoformat(row["started_at"]) if ("started_at" in row_keys and row["started_at"]) else None,
+        completed_at=datetime.fromisoformat(row["completed_at"]) if ("completed_at" in row_keys and row["completed_at"]) else None,
+        duration_seconds=row["duration_seconds"] if "duration_seconds" in row_keys else None,
         lease_expires_at=datetime.fromisoformat(row["lease_expires_at"]) if row["lease_expires_at"] else None,
         next_retry_at=datetime.fromisoformat(row["next_retry_at"]) if row["next_retry_at"] else None,
         result=json.loads(row["result_json"]) if row["result_json"] else None,
@@ -722,12 +789,21 @@ def job_response(connection, row) -> JobResponse:
         (row["id"],),
     ).fetchall()
     state_counts = {item["state"]: item["count"] for item in counts}
+    row_keys = row.keys() if hasattr(row, "keys") else []
+    scheduling_policy = row["scheduling_policy"] if "scheduling_policy" in row_keys else "automatic"
+    scheduling_config = (
+        json.loads(row["scheduling_config_json"])
+        if ("scheduling_config_json" in row_keys and row["scheduling_config_json"])
+        else {}
+    )
     return JobResponse(
         id=row["id"],
         cluster_id=row["cluster_id"],
         workload_id=row["workload_id"],
         name=row["name"],
         execution_mode=row["execution_mode"],
+        scheduling_policy=scheduling_policy,
+        scheduling_config=scheduling_config,
         priority=row["priority"],
         state=row["state"],
         retry_limit=row["retry_limit"],
@@ -794,22 +870,90 @@ def create_job(payload: JobCreateRequest, user: CurrentUser) -> JobResponse:
             ]
             if mismatched_tasks:
                 raise HTTPException(status_code=400, detail=f"Tasks do not match workload operation: {mismatched_tasks}")
+        
+        # Pinned node resolution for Manual / Hybrid scheduling
+        pinned_map: dict[str, str | None] = {}
+        for task in payload.tasks:
+            if task.pinned_node_id:
+                pinned_map[task.task_key] = task.pinned_node_id
+
+        allocations = payload.scheduling_config.get("allocations") if isinstance(payload.scheduling_config, dict) else None
+        if payload.scheduling_policy in ("manual", "hybrid") and isinstance(allocations, dict) and allocations:
+            total_tasks = len(payload.tasks)
+            alloc_sum = sum(v for v in allocations.values() if isinstance(v, (int, float)))
+            is_percentage = alloc_sum > 0 and 95 <= alloc_sum <= 105
+            
+            task_targets: list[str] = []
+            for node_id, weight in allocations.items():
+                if not isinstance(weight, (int, float)) or weight <= 0:
+                    continue
+                count = int(round((weight / 100.0) * total_tasks)) if is_percentage else int(weight)
+                task_targets.extend([node_id] * count)
+            
+            target_idx = 0
+            for task in payload.tasks:
+                if task.task_key not in pinned_map and target_idx < len(task_targets):
+                    pinned_map[task.task_key] = task_targets[target_idx]
+                    target_idx += 1
+
         job_id = str(uuid.uuid4())
         connection.execute(
             """
-            INSERT INTO jobs(id, cluster_id, owner_id, workload_id, name, execution_mode, priority, retry_limit, lease_seconds, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs(
+                id, cluster_id, owner_id, workload_id, name, execution_mode,
+                scheduling_policy, scheduling_config_json, priority, retry_limit,
+                lease_seconds, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (job_id, payload.cluster_id, user.id, payload.workload_id, payload.name.strip(), payload.execution_mode, payload.priority, payload.retry_limit, payload.lease_seconds, timestamp(now), timestamp(now)),
+            (
+                job_id,
+                payload.cluster_id,
+                user.id,
+                payload.workload_id,
+                payload.name.strip(),
+                payload.execution_mode,
+                payload.scheduling_policy,
+                canonical_json(payload.scheduling_config),
+                payload.priority,
+                payload.retry_limit,
+                payload.lease_seconds,
+                timestamp(now),
+                timestamp(now),
+            ),
         )
         connection.executemany(
             """
-            INSERT INTO tasks(id, job_id, task_key, payload_json, payload_hash, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks(id, job_id, task_key, payload_json, payload_hash, pinned_node_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [(str(uuid.uuid4()), job_id, task.task_key, canonical_json(task.payload), json_hash(task.payload), timestamp(now), timestamp(now)) for task in payload.tasks],
+            [
+                (
+                    str(uuid.uuid4()),
+                    job_id,
+                    task.task_key,
+                    canonical_json(task.payload),
+                    json_hash(task.payload),
+                    pinned_map.get(task.task_key),
+                    timestamp(now),
+                    timestamp(now),
+                )
+                for task in payload.tasks
+            ],
         )
-        record_audit(connection, user.id, "job.created", "job", job_id, "success", {"task_count": len(payload.tasks), "workload_id": payload.workload_id})
+        record_audit(
+            connection,
+            user.id,
+            "job.created",
+            "job",
+            job_id,
+            "success",
+            {
+                "task_count": len(payload.tasks),
+                "workload_id": payload.workload_id,
+                "scheduling_policy": payload.scheduling_policy,
+            },
+        )
         row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return job_response(connection, row)
 
@@ -848,6 +992,221 @@ def get_final_result(job_id: str, user: CurrentUser) -> FinalResultResponse:
         ).fetchall()
     results = [{"task_key": row["task_key"], "result": json.loads(row["result_json"])} for row in rows]
     return FinalResultResponse(job_id=job_id, aggregation="collect", task_count=len(results), result_hash=json_hash(results), results=results)
+
+
+@app.get("/api/v1/jobs/{job_id}/report")
+def get_job_report(job_id: str, user: CurrentUser, format: str | None = None) -> Any:
+    with connection_scope() as connection:
+        job = require_master_job(connection, job_id, user)
+        tasks_rows = connection.execute(
+            """
+            SELECT tasks.*, nodes.node_name FROM tasks
+            LEFT JOIN nodes ON nodes.id = tasks.assigned_node_id
+            WHERE tasks.job_id = ? ORDER BY tasks.task_key
+            """,
+            (job_id,),
+        ).fetchall()
+
+        node_stats: dict[str, dict[str, Any]] = {}
+        report_tasks: list[TaskReportItem] = []
+        for row in tasks_rows:
+            node_id = row["assigned_node_id"] or "unassigned"
+            node_name = row["node_name"] or "Unassigned"
+            if node_id not in node_stats and node_id != "unassigned":
+                node_stats[node_id] = {
+                    "node_id": node_id,
+                    "node_name": node_name,
+                    "tasks_completed": 0,
+                    "tasks_failed": 0,
+                    "total_compute_seconds": 0.0,
+                }
+            if row["state"] == "succeeded" and node_id in node_stats:
+                node_stats[node_id]["tasks_completed"] += 1
+                if row["duration_seconds"]:
+                    node_stats[node_id]["total_compute_seconds"] += float(row["duration_seconds"])
+            elif row["state"] == "failed" and node_id in node_stats:
+                node_stats[node_id]["tasks_failed"] += 1
+
+            report_tasks.append(
+                TaskReportItem(
+                    task_key=row["task_key"],
+                    state=row["state"],
+                    attempt=row["attempt"],
+                    assigned_node_id=row["assigned_node_id"],
+                    node_name=row["node_name"],
+                    started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+                    completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+                    duration_seconds=row["duration_seconds"],
+                    error=row["error"],
+                )
+            )
+
+        nodes_summary = []
+        for n_id, data in node_stats.items():
+            completed = data["tasks_completed"]
+            tot_sec = round(data["total_compute_seconds"], 3)
+            avg_sec = round(tot_sec / completed, 3) if completed > 0 else 0.0
+            nodes_summary.append(
+                NodePerformanceSummary(
+                    node_id=n_id,
+                    node_name=data["node_name"],
+                    tasks_completed=completed,
+                    tasks_failed=data["tasks_failed"],
+                    total_compute_seconds=tot_sec,
+                    avg_task_duration_seconds=avg_sec,
+                )
+            )
+
+        task_count = len(report_tasks)
+        succeeded_count = sum(1 for t in report_tasks if t.state == "succeeded")
+        failed_count = sum(1 for t in report_tasks if t.state == "failed")
+
+        created = datetime.fromisoformat(job["created_at"])
+        updated = datetime.fromisoformat(job["updated_at"])
+        total_duration = (updated - created).total_seconds() if job["state"] in ("completed", "failed", "canceled") else None
+
+        row_keys = job.keys() if hasattr(job, "keys") else []
+        scheduling_policy = job["scheduling_policy"] if "scheduling_policy" in row_keys else "automatic"
+
+        report = JobReportResponse(
+            job_id=job["id"],
+            job_name=job["name"],
+            cluster_id=job["cluster_id"],
+            state=job["state"],
+            execution_mode=job["execution_mode"],
+            scheduling_policy=scheduling_policy,
+            priority=job["priority"],
+            task_count=task_count,
+            succeeded_count=succeeded_count,
+            failed_count=failed_count,
+            total_duration_seconds=round(total_duration, 2) if total_duration else None,
+            created_at=created,
+            updated_at=updated,
+            nodes=nodes_summary,
+            tasks=report_tasks,
+        )
+
+        if format == "markdown":
+            from fastapi.responses import PlainTextResponse
+            md_lines = [
+                f"# NEXORA Job Execution Report: {report.job_name}",
+                f"- **Job ID**: `{report.job_id}`",
+                f"- **Cluster ID**: `{report.cluster_id}`",
+                f"- **State**: **{report.state.upper()}**",
+                f"- **Scheduling Policy**: {report.scheduling_policy}",
+                f"- **Tasks Summary**: {report.succeeded_count}/{report.task_count} succeeded, {report.failed_count} failed",
+                f"- **Total Wall Duration**: {report.total_duration_seconds or 'In-progress'} seconds",
+                f"- **Created At**: {report.created_at.isoformat()}",
+                f"- **Updated At**: {report.updated_at.isoformat()}",
+                "",
+                "## Node Contribution Summary",
+                "| Node Name | Node ID | Succeeded | Failed | Total Compute (s) | Avg Duration (s) |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- |",
+            ]
+            for n in report.nodes:
+                md_lines.append(f"| {n.node_name} | `{n.node_id}` | {n.tasks_completed} | {n.tasks_failed} | {n.total_compute_seconds} | {n.avg_task_duration_seconds} |")
+            if not report.nodes:
+                md_lines.append("| None | — | 0 | 0 | 0.0 | 0.0 |")
+            md_lines.extend([
+                "",
+                "## Task Execution Details",
+                "| Task Key | State | Attempt | Assigned Node | Duration (s) | Error |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- |",
+            ])
+            for t in report.tasks:
+                md_lines.append(f"| {t.task_key} | {t.state} | {t.attempt} | {t.node_name or 'Unassigned'} | {t.duration_seconds or '—'} | {t.error or 'None'} |")
+            return PlainTextResponse("\n".join(md_lines), media_type="text/markdown")
+
+        return report
+
+
+@app.get("/api/v1/clusters/{cluster_id}/summary", response_model=ClusterSummaryResponse)
+def get_cluster_summary(cluster_id: str, user: CurrentUser) -> ClusterSummaryResponse:
+    with connection_scope() as connection:
+        cluster = require_master_cluster(connection, cluster_id, user)
+        connection.execute(
+            """
+            UPDATE nodes SET status = 'offline', updated_at = ?
+            WHERE status = 'online' AND last_heartbeat_at < ?
+              AND id IN (SELECT node_id FROM cluster_members WHERE cluster_id = ?)
+            """,
+            (timestamp(utc_now()), timestamp(utc_now() - timedelta(seconds=HEARTBEAT_STALE_SECONDS)), cluster_id),
+        )
+        nodes = connection.execute(
+            """
+            SELECT nodes.* FROM nodes
+            JOIN cluster_members ON cluster_members.node_id = nodes.id
+            WHERE cluster_members.cluster_id = ?
+            """,
+            (cluster_id,),
+        ).fetchall()
+        jobs = connection.execute(
+            "SELECT state FROM jobs WHERE cluster_id = ?",
+            (cluster_id,),
+        ).fetchall()
+
+        reg_count = len(nodes)
+        online_count = sum(1 for n in nodes if n["status"] == "online")
+        offline_count = sum(1 for n in nodes if n["status"] == "offline")
+        detected_gpus = sum(1 for n in nodes if n["gpu_model"])
+        total_vram = sum((n["gpu_vram_bytes"] or 0) for n in nodes)
+
+        active_jobs = sum(1 for j in jobs if j["state"] in ("running", "paused"))
+        queued_jobs = sum(1 for j in jobs if j["state"] == "queued")
+        completed_jobs = sum(1 for j in jobs if j["state"] == "completed")
+        failed_jobs = sum(1 for j in jobs if j["state"] == "failed")
+
+        return ClusterSummaryResponse(
+            cluster_id=cluster_id,
+            cluster_name=cluster["name"],
+            registered_nodes=reg_count,
+            online_nodes=online_count,
+            offline_nodes=offline_count,
+            detected_gpus=detected_gpus,
+            total_vram_bytes=total_vram,
+            active_jobs=active_jobs,
+            queued_jobs=queued_jobs,
+            completed_jobs=completed_jobs,
+            failed_jobs=failed_jobs,
+        )
+
+
+@app.get("/api/v1/worker/my-nodes", response_model=list[NodeResponse])
+def list_my_worker_nodes(user: CurrentUser) -> list[NodeResponse]:
+    with connection_scope() as connection:
+        rows = connection.execute(
+            """
+            SELECT nodes.*, COALESCE(cluster_members.status, 'unpaired') AS membership_status
+            FROM nodes
+            LEFT JOIN cluster_members ON cluster_members.node_id = nodes.id
+            WHERE nodes.owner_id = ?
+            ORDER BY nodes.created_at DESC
+            """,
+            (user.id,),
+        ).fetchall()
+    return [node_response(row) for row in rows]
+
+
+@app.post("/api/v1/worker/nodes/{node_id}/drain", response_model=NodeResponse)
+def drain_worker_node(node_id: str, user: CurrentUser) -> NodeResponse:
+    now = utc_now()
+    with connection_scope() as connection:
+        require_worker_node(connection, node_id, user)
+        connection.execute(
+            "UPDATE nodes SET status = 'draining', updated_at = ? WHERE id = ?",
+            (timestamp(now), node_id),
+        )
+        row = connection.execute(
+            """
+            SELECT nodes.*, COALESCE(cluster_members.status, 'unpaired') AS membership_status
+            FROM nodes
+            LEFT JOIN cluster_members ON cluster_members.node_id = nodes.id
+            WHERE nodes.id = ?
+            """,
+            (node_id,),
+        ).fetchone()
+        record_audit(connection, user.id, "node.drain", "node", node_id, "success")
+    return node_response(row)
 
 
 def update_job_state(job_id: str, user: UserResponse, expected_states: tuple[str, ...], next_state: str) -> JobResponse:
@@ -944,10 +1303,11 @@ def lease_task(node_id: str, user: CurrentUser) -> TaskLeaseResponse | None:
             SELECT tasks.*, jobs.lease_seconds FROM tasks
             JOIN jobs ON jobs.id = tasks.job_id
             WHERE jobs.cluster_id = ? AND jobs.state IN ('queued', 'running')
-                            AND tasks.state = 'queued' AND (tasks.next_retry_at IS NULL OR tasks.next_retry_at <= ?)
+              AND tasks.state = 'queued' AND (tasks.next_retry_at IS NULL OR tasks.next_retry_at <= ?)
+              AND (tasks.pinned_node_id IS NULL OR tasks.pinned_node_id = ?)
             ORDER BY jobs.priority DESC, jobs.created_at, tasks.created_at LIMIT 100
             """,
-                        (membership["cluster_id"], timestamp(now)),
+            (membership["cluster_id"], timestamp(now), node_id),
         ).fetchall()
         row = next((candidate for candidate in candidates if task_is_compatible_with_node(json.loads(candidate["payload_json"]), node)), None)
         if row is None:
@@ -955,12 +1315,13 @@ def lease_task(node_id: str, user: CurrentUser) -> TaskLeaseResponse | None:
         lease_token = secrets.token_urlsafe(32)
         lease_expires_at = now + timedelta(seconds=row["lease_seconds"])
         attempt = row["attempt"] + 1
+        started_at = row["started_at"] or timestamp(now)
         connection.execute(
             """
             UPDATE tasks SET state = 'leased', attempt = ?, assigned_node_id = ?,
-                lease_token_hash = ?, lease_expires_at = ?, next_retry_at = NULL, updated_at = ? WHERE id = ?
+                lease_token_hash = ?, lease_expires_at = ?, next_retry_at = NULL, started_at = ?, updated_at = ? WHERE id = ?
             """,
-            (attempt, node_id, hash_token(lease_token), timestamp(lease_expires_at), timestamp(now), row["id"]),
+            (attempt, node_id, hash_token(lease_token), timestamp(lease_expires_at), started_at, timestamp(now), row["id"]),
         )
         connection.execute(
             "INSERT INTO task_attempts(id, task_id, attempt, node_id, state, leased_at) VALUES (?, ?, ?, ?, 'leased', ?)",
@@ -1002,13 +1363,35 @@ def submit_task_result(task_id: str, payload: TaskResultRequest, user: CurrentUs
             next_state = "queued" if task["attempt"] < task["retry_limit"] + 1 else "failed"
             next_error = payload.error
         retry_at = now + timedelta(seconds=retry_delay_seconds(task["attempt"])) if next_state == "queued" else None
+        
+        started_at = task["started_at"]
+        duration_seconds = None
+        if started_at:
+            try:
+                duration_seconds = round(max(0.0, (now - datetime.fromisoformat(started_at)).total_seconds()), 3)
+            except Exception:
+                pass
+        completed_at = timestamp(now) if payload.status == "succeeded" else None
+
         connection.execute(
             """
             UPDATE tasks SET state = ?, assigned_node_id = ?, lease_token_hash = NULL,
-                lease_expires_at = NULL, next_retry_at = ?, result_json = ?, result_hash = ?, error = ?, updated_at = ?
+                lease_expires_at = NULL, next_retry_at = ?, result_json = ?, result_hash = ?, error = ?,
+                completed_at = ?, duration_seconds = ?, updated_at = ?
             WHERE id = ?
             """,
-            (next_state, task["assigned_node_id"] if next_state == "succeeded" else None, timestamp(retry_at) if retry_at else None, result_json, result_hash, next_error, timestamp(now), task_id),
+            (
+                next_state,
+                task["assigned_node_id"] if next_state == "succeeded" else None,
+                timestamp(retry_at) if retry_at else None,
+                result_json,
+                result_hash,
+                next_error,
+                completed_at,
+                duration_seconds,
+                timestamp(now),
+                task_id,
+            ),
         )
         connection.execute(
             "UPDATE task_attempts SET state = ?, completed_at = ?, error = ? WHERE task_id = ? AND attempt = ?",

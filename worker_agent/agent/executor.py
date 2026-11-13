@@ -40,6 +40,27 @@ def execute_task(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("sum requires a list of numeric values")
         return {"value": sum(values)}
 
+    if operation == "matmul":
+        matrix_a = payload.get("matrix_a")
+        matrix_b = payload.get("matrix_b")
+        if not isinstance(matrix_a, list) or not isinstance(matrix_b, list):
+            raise ValueError("matmul requires matrix_a and matrix_b lists")
+        if not matrix_a or not matrix_b or not isinstance(matrix_a[0], list) or not isinstance(matrix_b[0], list):
+            raise ValueError("matmul matrices must be non-empty 2D lists")
+        rows_a = len(matrix_a)
+        cols_a = len(matrix_a[0])
+        rows_b = len(matrix_b)
+        cols_b = len(matrix_b[0])
+        if cols_a != rows_b:
+            raise ValueError(f"Incompatible matrix dimensions: ({rows_a}x{cols_a}) and ({rows_b}x{cols_b})")
+        result = [[0.0 for _ in range(cols_b)] for _ in range(rows_a)]
+        for i in range(rows_a):
+            for k in range(cols_a):
+                val_a = float(matrix_a[i][k])
+                for j in range(cols_b):
+                    result[i][j] += val_a * float(matrix_b[k][j])
+        return {"matrix": result}
+
     raise UnsupportedOperation(f"Unsupported task operation: {operation}")
 
 

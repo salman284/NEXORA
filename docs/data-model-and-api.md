@@ -57,6 +57,8 @@ SQLite is the development default. PostgreSQL is the production migration target
 - `GET /api/v1/jobs/{job_id}`
 - `GET /api/v1/jobs/{job_id}/tasks`
 - `GET /api/v1/jobs/{job_id}/result`
+- `GET /api/v1/jobs/{job_id}/report` (supports `format=markdown` or JSON report)
+- `GET /api/v1/clusters/{cluster_id}/summary` (aggregate VRAM and node/job pipeline breakdown)
 - `GET /api/v1/jobs/{job_id}/artifacts`
 - `GET /api/v1/artifacts/{artifact_id}/download`
 
@@ -64,6 +66,8 @@ SQLite is the development default. PostgreSQL is the production migration target
 
 - `POST /api/v1/worker/register`
 - `WS /api/v1/worker/session`
+- `GET /api/v1/worker/my-nodes`
+- `POST /api/v1/worker/nodes/{node_id}/drain`
 - `POST /api/v1/worker/heartbeat`
 - `POST /api/v1/worker/nodes/{node_id}/tasks/lease`
 - `POST /api/v1/worker/tasks/{task_id}/result`

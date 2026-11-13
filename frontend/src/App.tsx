@@ -1,21 +1,25 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, Cpu, Database, FileUp, LogOut, Network, Plus, RefreshCw, Settings, ShieldCheck, Wifi, Zap } from "lucide-react";
+import { Activity, Cpu, Database, Download, FileText, FileUp, LogOut, Network, Plus, RefreshCw, Settings, ShieldCheck, Wifi, Zap } from "lucide-react";
 
 type User = { full_name: string; username: string; email: string; roles: string[] };
 type Cluster = { id: string; name: string; status: string; created_at: string };
 type PairingCode = { code: string; expires_at: string };
 type Workload = { id: string; name: string; content_hash: string; size_bytes: number; validation_state: string; manifest: { operation: string; backend: string; execution_mode: string }; created_at: string };
-type Job = { id: string; cluster_id: string; workload_id: string | null; name: string; execution_mode: string; state: string; task_count: number; succeeded_count: number; failed_count: number; queued_count: number; created_at: string };
-type Task = { id: string; task_key: string; state: string; attempt: number; assigned_node_id: string | null; result: Record<string, unknown> | null; error: string | null };
+type Job = { id: string; cluster_id: string; workload_id: string | null; name: string; execution_mode: string; scheduling_policy?: string; scheduling_config?: Record<string, unknown>; state: string; task_count: number; succeeded_count: number; failed_count: number; queued_count: number; created_at: string };
+type Task = { id: string; task_key: string; state: string; attempt: number; assigned_node_id: string | null; pinned_node_id?: string | null; started_at?: string | null; completed_at?: string | null; duration_seconds?: number | null; result: Record<string, unknown> | null; error: string | null };
 type FinalResult = { job_id: string; aggregation: string; task_count: number; result_hash: string; results: Array<{ task_key: string; result: Record<string, unknown> }> };
-type Node = { id: string; node_name: string; hostname: string; status: string; membership_status: string; private_ipv4: string | null; gpu_model: string | null; gpu_vram_bytes: number | null; compute_backend: string | null; cpu_utilization: number | null; ram_utilization: number | null; gpu_utilization: number | null; last_heartbeat_at: string | null };
+type Node = { id: string; node_name: string; hostname: string; status: string; membership_status: string; private_ipv4: string | null; gpu_vendor?: string | null; gpu_model: string | null; gpu_vram_bytes: number | null; compute_backend: string | null; cpu_utilization: number | null; ram_utilization: number | null; gpu_utilization: number | null; gpu_used_vram_bytes?: number | null; last_heartbeat_at: string | null };
 type Telemetry = { node_id: string; node_name: string; captured_at: string; source: string; cpu_utilization: number | null; ram_utilization: number | null; gpu_utilization: number | null; gpu_used_vram_bytes: number | null };
 type NetworkReport = { local_private_ipv4: string[]; master_host: string | null; master_port: number; resolution: string; resolved_addresses: string[]; tcp_state: string; latency_ms: number | null; detail: string | null };
 type AuditEvent = { id: string; action: string; scope_type: string; scope_id: string | null; outcome: string; metadata: Record<string, unknown>; created_at: string };
+type ClusterSummary = { cluster_id: string; cluster_name: string; registered_nodes: number; online_nodes: number; offline_nodes: number; detected_gpus: number; total_vram_bytes: number; active_jobs: number; queued_jobs: number; completed_jobs: number; failed_jobs: number };
 
 const api = async <T,>(path: string, options: RequestInit = {}): Promise<T> => {
   const headers = options.body instanceof FormData ? { ...options.headers } : { "Content-Type": "application/json", ...options.headers };
   const response = await fetch(path, { ...options, headers });
+  if (response.headers.get("content-type")?.includes("text/markdown")) {
+    return response.text() as unknown as T;
+  }
   const body = await response.json().catch(() => null);
   if (!response.ok) throw new Error(body?.detail ?? `Request failed (${response.status})`);
   return body as T;
@@ -43,24 +47,552 @@ function Login({ onLogin }: { onLogin: (token: string, user: User) => void }) {
 
 function Metric({ label, value, tone = "green" }: { label: string; value: string; tone?: string }) { return <div className="metric"><span>{label}</span><strong className={tone}>{value}</strong></div>; }
 
-function NodeOverview({ nodes, telemetry, jobs, clusters, selectedId, clusterName, setSelectedId, setClusterName, onCreateCluster, onRefresh, onPair, onApprove, onRevoke }: { nodes: Node[]; telemetry: Telemetry[]; jobs: Job[]; clusters: Cluster[]; selectedId: string; clusterName: string; setSelectedId: (value: string) => void; setClusterName: (value: string) => void; onCreateCluster: (event: React.FormEvent) => void; onRefresh: () => void; onPair: () => void; onApprove: (nodeId: string) => void; onRevoke: (nodeId: string) => void }) {
-  const onlineCount = nodes.filter((node) => node.status === "online").length;
-  const activeJobs = jobs.filter((job) => ["queued", "running", "paused"].includes(job.state)).length;
-  const completedJobs = jobs.filter((job) => job.state === "completed").length;
-  const recent = telemetry.slice(0, 12).reverse();
-  return <><section className="hero-strip"><div><span className="eyebrow">Operational snapshot</span><h2>{nodes.length ? `${onlineCount} node${onlineCount === 1 ? "" : "s"} reporting` : "Cluster is ready"}</h2><p>{nodes.length ? "Telemetry refreshes every five seconds." : "Pair a Worker to start seeing live capacity."}</p></div><div className="hero-orbit"><div className="orbit-core"><ShieldCheck size={25} /><span>trusted LAN</span></div><div className="orbit-line line-a" /><div className="orbit-line line-b" /></div></section><section className="metrics-grid"><div className="stat-card"><span>Registered nodes</span><strong>{nodes.length}</strong><small>in selected cluster</small></div><div className="stat-card"><span>Online now</span><strong className="green-text">{onlineCount}</strong><small>heartbeat confirmed</small></div><div className="stat-card"><span>Detected GPUs</span><strong>{nodes.filter((node) => node.gpu_model).length}</strong><small>per-node capacity</small></div><div className="stat-card"><span>Active jobs</span><strong>{activeJobs}</strong><small>{completedJobs} completed</small></div></section><section className="telemetry-panel"><div><span className="eyebrow">Measured telemetry</span><h2>Recent resource trend</h2></div>{recent.length === 0 ? <span className="telemetry-empty">No heartbeat samples yet</span> : <div className="telemetry-bars">{recent.map((sample) => <div className="telemetry-column" key={`${sample.node_id}-${sample.captured_at}`} title={`${sample.node_name} · ${new Date(sample.captured_at).toLocaleTimeString()}`}><i className="cpu-bar" style={{ height: `${sample.cpu_utilization ?? 0}%` }} /><i className="ram-bar" style={{ height: `${sample.ram_utilization ?? 0}%` }} /></div>)}</div>}<div className="telemetry-legend"><span><i className="cpu-dot" /> CPU measured</span><span><i className="ram-dot" /> RAM measured</span><span>GPU unavailable when unsupported</span></div></section><div className="section-heading"><div><span className="eyebrow">Cluster capacity</span><h2>Nodes</h2></div><div className="cluster-tools"><select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}><option value="">Select cluster</option>{clusters.map((cluster) => <option key={cluster.id} value={cluster.id}>{cluster.name}</option>)}</select><form onSubmit={onCreateCluster} className="create-cluster"><input placeholder="New cluster name" value={clusterName} onChange={(event) => setClusterName(event.target.value)} /><button className="small-button" title="Create cluster" type="submit"><Plus size={16} /></button></form><button className="small-button pair-button" onClick={onPair}><Wifi size={15} /> Pair Worker</button><button className="icon-button" title="Refresh nodes" onClick={onRefresh}><RefreshCw size={17} /></button></div></div><section className="node-grid">{nodes.length === 0 ? <div className="empty-state"><Wifi size={24} /><strong>No nodes connected</strong><p>Generate a pairing code, approve a Worker, and its heartbeat will appear here.</p></div> : nodes.map((node) => <article className="node-card" key={node.id}><div className="node-header"><div className="node-icon"><Cpu size={18} /></div><div><h3>{node.node_name}</h3><span>{node.hostname} · {node.private_ipv4 ?? "address unavailable"}</span></div><span className={`status ${node.status}`}>{node.status}</span></div><div className="node-gpu"><span>GPU</span><strong>{node.gpu_model ?? "Not detected"}</strong><small>{node.compute_backend ?? "Backend unavailable"} · {node.gpu_vram_bytes ? `${(node.gpu_vram_bytes / 1e9).toFixed(1)} GB VRAM` : "VRAM unavailable"}</small></div><div className="node-metrics"><Metric label="CPU" value={node.cpu_utilization == null ? "Unavailable" : `${node.cpu_utilization.toFixed(1)}%`} /><Metric label="RAM" value={node.ram_utilization == null ? "Unavailable" : `${node.ram_utilization.toFixed(1)}%`} /><Metric label="GPU" value={node.gpu_utilization == null ? "Unavailable" : `${node.gpu_utilization.toFixed(1)}%`} tone={node.gpu_utilization == null ? "muted" : "green"} /></div><footer><span>{node.membership_status}</span>{node.membership_status === "pending" ? <button className="approve-button" onClick={() => onApprove(node.id)}>Approve</button> : node.membership_status === "approved" ? <button className="revoke-button" onClick={() => onRevoke(node.id)}>Revoke</button> : <span>Access revoked</span>}</footer></article>)}</section></>;
+function ClusterTopology({ nodes, clusterName }: { nodes: Node[]; clusterName: string }) {
+  return (
+    <section className="topology-panel">
+      <div className="card-title">
+        <Network size={18} />
+        <div>
+          <span className="eyebrow">Cluster Topology Diagram</span>
+          <h2>LAN Compute Mesh</h2>
+        </div>
+      </div>
+      <div className="topology-container">
+        <div className="topology-node master-box">
+          <div className="node-icon"><Cpu size={18} /></div>
+          <div>
+            <strong>Master Hub ({clusterName || "Cluster"})</strong>
+            <span>Control Plane · Port 5000 · Outbound Worker Discovery</span>
+          </div>
+          <span className="status online">Active Master</span>
+        </div>
+        <div className="topology-tree">
+          {nodes.length === 0 ? (
+            <div className="topology-empty">
+              No Worker Nodes paired yet. Click "Pair Worker" to generate a pairing code for LAN machines.
+            </div>
+          ) : (
+            nodes.map((node) => (
+              <div key={node.id} className="topology-branch">
+                <div className="topology-line" />
+                <div className={`topology-node worker-box ${node.status}`}>
+                  <div className="worker-info">
+                    <strong>{node.node_name}</strong>
+                    <span>{node.hostname} · {node.private_ipv4 ?? "IPv4 unverified"} · {node.compute_backend ?? "CPU"}</span>
+                    <small>{node.gpu_model ?? "No GPU"} {node.gpu_vram_bytes ? `(${(node.gpu_vram_bytes / 1e9).toFixed(1)} GB VRAM)` : ""}</small>
+                  </div>
+                  <div className="worker-status-badge">
+                    <span className={`status ${node.status}`}>{node.status}</span>
+                    <span className="task-pill">{node.status === "online" ? "Ready / Polling" : "Offline"}</span>
+                  </div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </section>
+  );
 }
 
-function WorkloadsView({ token, clusterId, workloads, jobs, onRefresh, onError }: { token: string; clusterId: string; workloads: Workload[]; jobs: Job[]; onRefresh: () => void; onError: (message: string) => void }) {
-  const [name, setName] = useState("Square batch"); const [operation, setOperation] = useState("square"); const [backend, setBackend] = useState("cpu"); const [file, setFile] = useState<File | null>(null); const [selectedWorkload, setSelectedWorkload] = useState(""); const [taskJson, setTaskJson] = useState('[{"task_key":"item-1","payload":{"operation":"square","value":2}}]'); const [jobName, setJobName] = useState("First distributed batch"); const [busy, setBusy] = useState(false); const [selectedJobId, setSelectedJobId] = useState(""); const [tasks, setTasks] = useState<Task[]>([]); const headers = { Authorization: `Bearer ${token}` };
-  async function upload(event: React.FormEvent) { event.preventDefault(); if (!file) { onError("Choose a ZIP package first"); return; } setBusy(true); try { const body = new FormData(); body.append("manifest", JSON.stringify({ schema_version: "1", name, runtime: "builtin", backend, execution_mode: "task_parallel", operation, aggregation: "collect" })); body.append("file", file); await api<Workload>("/api/v1/workloads", { method: "POST", headers, body }); setFile(null); onRefresh(); } catch (requestError) { onError(requestError instanceof Error ? requestError.message : "Upload failed"); } finally { setBusy(false); } }
-  async function launch(event: React.FormEvent) { event.preventDefault(); if (!clusterId) { onError("Select or create a cluster first"); return; } try { await api<Job>("/api/v1/jobs", { method: "POST", headers, body: JSON.stringify({ cluster_id: clusterId, workload_id: selectedWorkload || null, name: jobName, tasks: JSON.parse(taskJson) }) }); onRefresh(); } catch (requestError) { onError(requestError instanceof Error ? requestError.message : "Job launch failed"); } }
-  async function inspectJob(jobId: string) { setSelectedJobId(jobId); try { setTasks(await api<Task[]>(`/api/v1/jobs/${jobId}/tasks`, { headers })); } catch (requestError) { onError(requestError instanceof Error ? requestError.message : "Unable to load tasks"); } }
-  useEffect(() => { if (!selectedJobId) return; const timer = window.setInterval(() => void inspectJob(selectedJobId), 5000); return () => window.clearInterval(timer); }, [selectedJobId]);
-  async function controlJob(action: "pause" | "resume" | "cancel") { if (!selectedJobId) return; if (action === "cancel" && !window.confirm("Cancel this job and all unfinished tasks?")) return; try { await api<Job>(`/api/v1/jobs/${selectedJobId}/${action}`, { method: "POST", headers }); await inspectJob(selectedJobId); onRefresh(); } catch (requestError) { onError(requestError instanceof Error ? requestError.message : `Unable to ${action} job`); } }
-  async function downloadResult() { if (!selectedJobId) return; try { const result = await api<FinalResult>(`/api/v1/jobs/${selectedJobId}/result`, { headers }); const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([JSON.stringify(result, null, 2)], { type: "application/json" })); link.download = `nexora-${selectedJobId}-result.json`; link.click(); URL.revokeObjectURL(link.href); } catch (requestError) { onError(requestError instanceof Error ? requestError.message : "Final result is not available"); } }
+function NodeOverview({ nodes, summary, telemetry, jobs, clusters, selectedId, clusterName, setSelectedId, setClusterName, onCreateCluster, onRefresh, onPair, onApprove, onRevoke }: { nodes: Node[]; summary: ClusterSummary | null; telemetry: Telemetry[]; jobs: Job[]; clusters: Cluster[]; selectedId: string; clusterName: string; setSelectedId: (value: string) => void; setClusterName: (value: string) => void; onCreateCluster: (event: React.FormEvent) => void; onRefresh: () => void; onPair: () => void; onApprove: (nodeId: string) => void; onRevoke: (nodeId: string) => void }) {
+  const onlineCount = summary?.online_nodes ?? nodes.filter((node) => node.status === "online").length;
+  const offlineCount = summary?.offline_nodes ?? nodes.filter((node) => node.status === "offline").length;
+  const activeJobs = summary?.active_jobs ?? jobs.filter((job) => ["queued", "running", "paused"].includes(job.state)).length;
+  const queuedJobs = summary?.queued_jobs ?? jobs.filter((job) => job.state === "queued").length;
+  const completedJobs = summary?.completed_jobs ?? jobs.filter((job) => job.state === "completed").length;
+  const failedJobs = summary?.failed_jobs ?? jobs.filter((job) => job.state === "failed").length;
+  const detectedGpus = summary?.detected_gpus ?? nodes.filter((node) => node.gpu_model).length;
+  const totalVramBytes = summary?.total_vram_bytes ?? nodes.reduce((acc, n) => acc + (n.gpu_vram_bytes ?? 0), 0);
+  const recent = telemetry.slice(0, 12).reverse();
+
+  return (
+    <>
+      <section className="hero-strip">
+        <div>
+          <span className="eyebrow">Operational snapshot</span>
+          <h2>{nodes.length ? `${onlineCount} node${onlineCount === 1 ? "" : "s"} reporting` : "Cluster is ready"}</h2>
+          <p>{nodes.length ? "Telemetry refreshes every five seconds." : "Pair a Worker to start seeing live capacity."}</p>
+        </div>
+        <div className="hero-orbit">
+          <div className="orbit-core"><ShieldCheck size={25} /><span>trusted LAN</span></div>
+          <div className="orbit-line line-a" />
+          <div className="orbit-line line-b" />
+        </div>
+      </section>
+
+      <section className="metrics-grid">
+        <div className="stat-card">
+          <span>Registered nodes</span>
+          <strong>{nodes.length}</strong>
+          <small>{onlineCount} online · {offlineCount} offline</small>
+        </div>
+        <div className="stat-card">
+          <span>Detected GPUs</span>
+          <strong className="green-text">{detectedGpus}</strong>
+          <small>per-node acceleration</small>
+        </div>
+        <div className="stat-card">
+          <span>Aggregate VRAM</span>
+          <strong>{(totalVramBytes / 1e9).toFixed(1)} GB</strong>
+          <span className="vram-capacity-note">Aggregate capacity across nodes (not unified pool)</span>
+        </div>
+        <div className="stat-card">
+          <span>Job Pipeline</span>
+          <strong>{activeJobs} Active</strong>
+          <small>{queuedJobs} queued · {completedJobs} done · {failedJobs} failed</small>
+        </div>
+      </section>
+
+      <ClusterTopology nodes={nodes} clusterName={clusterName} />
+
+      <section className="telemetry-panel">
+        <div><span className="eyebrow">Measured telemetry</span><h2>Recent resource trend</h2></div>
+        {recent.length === 0 ? <span className="telemetry-empty">No heartbeat samples yet</span> : (
+          <div className="telemetry-bars">
+            {recent.map((sample) => (
+              <div className="telemetry-column" key={`${sample.node_id}-${sample.captured_at}`} title={`${sample.node_name} · ${new Date(sample.captured_at).toLocaleTimeString()}`}>
+                <i className="cpu-bar" style={{ height: `${sample.cpu_utilization ?? 0}%` }} />
+                <i className="ram-bar" style={{ height: `${sample.ram_utilization ?? 0}%` }} />
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="telemetry-legend">
+          <span><i className="cpu-dot" /> CPU measured</span>
+          <span><i className="ram-dot" /> RAM measured</span>
+          <span>GPU metrics require verified backend adapter</span>
+        </div>
+      </section>
+
+      <div className="section-heading">
+        <div><span className="eyebrow">Cluster capacity</span><h2>Nodes</h2></div>
+        <div className="cluster-tools">
+          <select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}>
+            <option value="">Select cluster</option>
+            {clusters.map((cluster) => <option key={cluster.id} value={cluster.id}>{cluster.name}</option>)}
+          </select>
+          <form onSubmit={onCreateCluster} className="create-cluster">
+            <input placeholder="New cluster name" value={clusterName} onChange={(event) => setClusterName(event.target.value)} />
+            <button className="small-button" title="Create cluster" type="submit"><Plus size={16} /></button>
+          </form>
+          <button className="small-button pair-button" onClick={onPair}><Wifi size={15} /> Pair Worker</button>
+          <button className="icon-button" title="Refresh nodes" onClick={onRefresh}><RefreshCw size={17} /></button>
+        </div>
+      </div>
+
+      <section className="node-grid">
+        {nodes.length === 0 ? (
+          <div className="empty-state">
+            <Wifi size={24} />
+            <strong>No nodes connected</strong>
+            <p>Generate a pairing code, approve a Worker, and its heartbeat will appear here.</p>
+          </div>
+        ) : (
+          nodes.map((node) => {
+            const freeVram = node.gpu_vram_bytes ? Math.max(0, (node.gpu_vram_bytes - (node.gpu_used_vram_bytes ?? 0))) : null;
+            return (
+              <article className="node-card" key={node.id}>
+                <div className="node-header">
+                  <div className="node-icon"><Cpu size={18} /></div>
+                  <div>
+                    <h3>{node.node_name}</h3>
+                    <span>{node.hostname} · {node.private_ipv4 ?? "address unavailable"}</span>
+                  </div>
+                  <span className={`status ${node.status}`}>{node.status}</span>
+                </div>
+                <div className="node-gpu">
+                  <span>GPU & Compute Backend</span>
+                  <strong>{node.gpu_model ?? "Not detected"}</strong>
+                  <small>
+                    {node.compute_backend ?? "Backend unavailable"} · {node.gpu_vram_bytes ? `${(node.gpu_vram_bytes / 1e9).toFixed(1)} GB Total (${freeVram ? (freeVram / 1e9).toFixed(1) : 0} GB Free)` : "VRAM unavailable"}
+                  </small>
+                </div>
+                <div className="node-metrics">
+                  <Metric label="CPU" value={node.cpu_utilization == null ? "Unavailable" : `${node.cpu_utilization.toFixed(1)}%`} />
+                  <Metric label="RAM" value={node.ram_utilization == null ? "Unavailable" : `${node.ram_utilization.toFixed(1)}%`} />
+                  <Metric label="GPU" value={node.gpu_utilization == null ? "Unavailable" : `${node.gpu_utilization.toFixed(1)}%`} tone={node.gpu_utilization == null ? "muted" : "green"} />
+                </div>
+                <footer>
+                  <span>Membership: {node.membership_status}</span>
+                  {node.membership_status === "pending" ? (
+                    <button className="approve-button" onClick={() => onApprove(node.id)}>Approve</button>
+                  ) : node.membership_status === "approved" ? (
+                    <button className="revoke-button" onClick={() => onRevoke(node.id)}>Revoke</button>
+                  ) : (
+                    <span>Access revoked</span>
+                  )}
+                </footer>
+              </article>
+            );
+          })
+        )}
+      </section>
+    </>
+  );
+}
+
+function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, onError }: { token: string; clusterId: string; nodes: Node[]; workloads: Workload[]; jobs: Job[]; onRefresh: () => void; onError: (message: string) => void }) {
+  const [name, setName] = useState("Square batch");
+  const [operation, setOperation] = useState("square");
+  const [backend, setBackend] = useState("cpu");
+  const [file, setFile] = useState<File | null>(null);
+  const [selectedWorkload, setSelectedWorkload] = useState("");
+  const [taskJson, setTaskJson] = useState('[{"task_key":"item-1","payload":{"operation":"square","value":2}}]');
+  const [jobName, setJobName] = useState("First distributed batch");
+  const [schedulingPolicy, setSchedulingPolicy] = useState<"automatic" | "manual" | "hybrid">("automatic");
+  const [allocations, setAllocations] = useState<Record<string, number>>({});
+  const [busy, setBusy] = useState(false);
+  const [selectedJobId, setSelectedJobId] = useState("");
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const headers = { Authorization: `Bearer ${token}` };
+
+  async function upload(event: React.FormEvent) {
+    event.preventDefault();
+    if (!file) { onError("Choose a ZIP package first"); return; }
+    setBusy(true);
+    try {
+      const body = new FormData();
+      body.append("manifest", JSON.stringify({ schema_version: "1", name, runtime: "builtin", backend, execution_mode: "task_parallel", operation, aggregation: "collect" }));
+      body.append("file", file);
+      await api<Workload>("/api/v1/workloads", { method: "POST", headers, body });
+      setFile(null);
+      onRefresh();
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "Upload failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function launch(event: React.FormEvent) {
+    event.preventDefault();
+    if (!clusterId) { onError("Select or create a cluster first"); return; }
+    try {
+      const parsedTasks = JSON.parse(taskJson);
+      await api<Job>("/api/v1/jobs", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          cluster_id: clusterId,
+          workload_id: selectedWorkload || null,
+          name: jobName,
+          scheduling_policy: schedulingPolicy,
+          scheduling_config: { allocations },
+          tasks: parsedTasks,
+        }),
+      });
+      onRefresh();
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "Job launch failed");
+    }
+  }
+
+  async function inspectJob(jobId: string) {
+    setSelectedJobId(jobId);
+    try {
+      setTasks(await api<Task[]>(`/api/v1/jobs/${jobId}/tasks`, { headers }));
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "Unable to load tasks");
+    }
+  }
+
+  useEffect(() => {
+    if (!selectedJobId) return;
+    const timer = window.setInterval(() => void inspectJob(selectedJobId), 5000);
+    return () => window.clearInterval(timer);
+  }, [selectedJobId]);
+
+  async function controlJob(action: "pause" | "resume" | "cancel") {
+    if (!selectedJobId) return;
+    if (action === "cancel" && !window.confirm("Cancel this job and all unfinished tasks?")) return;
+    try {
+      await api<Job>(`/api/v1/jobs/${selectedJobId}/${action}`, { method: "POST", headers });
+      await inspectJob(selectedJobId);
+      onRefresh();
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : `Unable to ${action} job`);
+    }
+  }
+
+  async function downloadResult() {
+    if (!selectedJobId) return;
+    try {
+      const result = await api<FinalResult>(`/api/v1/jobs/${selectedJobId}/result`, { headers });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([JSON.stringify(result, null, 2)], { type: "application/json" }));
+      link.download = `nexora-${selectedJobId}-result.json`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "Final result is not available");
+    }
+  }
+
+  async function downloadReport(format: "markdown" | "json") {
+    if (!selectedJobId) return;
+    try {
+      const endpoint = format === "markdown" ? `/api/v1/jobs/${selectedJobId}/report?format=markdown` : `/api/v1/jobs/${selectedJobId}/report`;
+      const reportData = await api<string | Record<string, unknown>>(endpoint, { headers });
+      const content = typeof reportData === "string" ? reportData : JSON.stringify(reportData, null, 2);
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([content], { type: format === "markdown" ? "text/markdown" : "application/json" }));
+      link.download = `nexora-${selectedJobId}-report.${format === "markdown" ? "md" : "json"}`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "Unable to download execution report");
+    }
+  }
+
   const selectedJob = jobs.find((job) => job.id === selectedJobId);
-  return <><section className="hero-strip compact-hero"><div><span className="eyebrow">Execution workspace</span><h2>Package, then dispatch.</h2><p>Every job needs an explicit task contract. Nothing is auto-partitioned.</p></div><Zap size={42} className="hero-accent" /></section><div className="workload-columns"><section className="form-card"><div className="card-title"><FileUp size={18} /><div><span className="eyebrow">01 / package</span><h2>Upload workload</h2></div></div><form onSubmit={upload}><label>Package name<input value={name} onChange={(event) => setName(event.target.value)} /></label><div className="form-row"><label>Operation<select value={operation} onChange={(event) => setOperation(event.target.value)}><option value="square">square</option><option value="sum">sum</option><option value="identity">identity</option></select></label><label>Backend<select value={backend} onChange={(event) => setBackend(event.target.value)}><option value="cpu">CPU</option><option value="opencl">OpenCL</option></select></label></div><label className="file-input">ZIP package<input type="file" accept=".zip,application/zip" onChange={(event) => setFile(event.target.files?.[0] ?? null)} /></label><button className="primary-button" disabled={busy} type="submit">{busy ? "Validating…" : "Validate and store"}</button></form></section><section className="form-card"><div className="card-title"><Activity size={18} /><div><span className="eyebrow">02 / dispatch</span><h2>Launch job</h2></div></div><form onSubmit={launch}><label>Job name<input value={jobName} onChange={(event) => setJobName(event.target.value)} /></label><label>Validated workload<select value={selectedWorkload} onChange={(event) => setSelectedWorkload(event.target.value)}><option value="">No package (direct demo)</option>{workloads.map((workload) => <option key={workload.id} value={workload.id}>{workload.name} · {workload.manifest.backend}</option>)}</select></label><label>Task JSON<textarea value={taskJson} onChange={(event) => setTaskJson(event.target.value)} rows={5} /></label><button className="primary-button" type="submit">Create task-parallel job</button></form></section></div><section className="job-section"><div className="section-heading"><div><span className="eyebrow">Execution history</span><h2>Jobs</h2></div><button className="icon-button" title="Refresh jobs" onClick={onRefresh}><RefreshCw size={17} /></button></div>{jobs.length === 0 ? <div className="empty-state"><Database size={24} /><strong>No jobs yet</strong><p>Upload a package or use the direct demo task contract to create your first job.</p></div> : <div className="job-list">{jobs.map((job) => <div className={`job-row ${selectedJobId === job.id ? "selected" : ""}`} key={job.id} role="button" tabIndex={0} onClick={() => void inspectJob(job.id)} onKeyDown={(event) => { if (event.key === "Enter") void inspectJob(job.id); }}><div><strong>{job.name}</strong><span>{job.execution_mode} · {job.task_count} tasks</span></div><div className="job-progress"><span>{job.succeeded_count}/{job.task_count} complete</span><div><i style={{ width: `${job.task_count ? (job.succeeded_count / job.task_count) * 100 : 0}%` }} /></div></div><span className={`job-state ${job.state}`}>{job.state}</span></div>)}</div>}{selectedJobId && <div className="task-inspector"><div className="section-heading"><div><span className="eyebrow">Selected job</span><h2>Task detail</h2></div><div className="job-controls">{selectedJob?.state === "paused" && <button className="small-button" onClick={() => void controlJob("resume")}>Resume</button>}{(selectedJob?.state === "queued" || selectedJob?.state === "running") && <button className="small-button" onClick={() => void controlJob("pause")}>Pause</button>}{selectedJob && !["completed", "failed", "canceled"].includes(selectedJob.state) && <button className="revoke-button" onClick={() => void controlJob("cancel")}>Cancel job</button>}{selectedJob?.state === "completed" && <button className="small-button" onClick={() => void downloadResult()}>Download result</button>}</div></div><div className="task-table">{tasks.map((task) => <div className="task-row" key={task.id}><span>{task.task_key}</span><span className={`job-state ${task.state}`}>{task.state}</span><span>Attempt {task.attempt}</span><span>{task.assigned_node_id ?? "Unassigned"}</span><span>{task.error ?? (task.result ? JSON.stringify(task.result) : "No result")}</span></div>)}</div></div>}</section></>;
+  const approvedNodes = nodes.filter((n) => n.membership_status === "approved");
+
+  return (
+    <>
+      <section className="hero-strip compact-hero">
+        <div>
+          <span className="eyebrow">Execution workspace</span>
+          <h2>Intelligent Scheduler & Dispatch</h2>
+          <p>Task parallelism across verified GPU/CPU nodes with Automatic, Manual, or Hybrid distribution.</p>
+        </div>
+        <Zap size={42} className="hero-accent" />
+      </section>
+
+      <div className="workload-columns">
+        <section className="form-card">
+          <div className="card-title">
+            <FileUp size={18} />
+            <div><span className="eyebrow">01 / package</span><h2>Upload workload</h2></div>
+          </div>
+          <form onSubmit={upload}>
+            <label>Package name<input value={name} onChange={(event) => setName(event.target.value)} /></label>
+            <div className="form-row">
+              <label>Operation
+                <select value={operation} onChange={(event) => setOperation(event.target.value)}>
+                  <option value="square">square</option>
+                  <option value="sum">sum</option>
+                  <option value="matmul">matmul (Matrix Multiply)</option>
+                  <option value="identity">identity</option>
+                </select>
+              </label>
+              <label>Backend
+                <select value={backend} onChange={(event) => setBackend(event.target.value)}>
+                  <option value="cpu">CPU</option>
+                  <option value="opencl">OpenCL</option>
+                </select>
+              </label>
+            </div>
+            <label className="file-input">ZIP package<input type="file" accept=".zip,application/zip" onChange={(event) => setFile(event.target.files?.[0] ?? null)} /></label>
+            <button className="primary-button" disabled={busy} type="submit">{busy ? "Validating…" : "Validate and store"}</button>
+          </form>
+        </section>
+
+        <section className="form-card">
+          <div className="card-title">
+            <Activity size={18} />
+            <div><span className="eyebrow">02 / dispatch</span><h2>Launch job</h2></div>
+          </div>
+          <form onSubmit={launch}>
+            <label>Job name<input value={jobName} onChange={(event) => setJobName(event.target.value)} /></label>
+            <label>Validated workload
+              <select value={selectedWorkload} onChange={(event) => setSelectedWorkload(event.target.value)}>
+                <option value="">No package (direct demo)</option>
+                {workloads.map((workload) => <option key={workload.id} value={workload.id}>{workload.name} · {workload.manifest.backend}</option>)}
+              </select>
+            </label>
+            <label>Scheduling Mode
+              <select value={schedulingPolicy} onChange={(event) => setSchedulingPolicy(event.target.value as any)}>
+                <option value="automatic">Mode A: Automatic (Dynamic based on VRAM/GPU/CPU)</option>
+                <option value="manual">Mode B: Manual Distribution (Target specific Workers)</option>
+                <option value="hybrid">Mode C: Hybrid (Target Workers for subset, auto-distribute rest)</option>
+              </select>
+            </label>
+            {schedulingPolicy !== "automatic" && (
+              <div className="allocation-box">
+                <span className="eyebrow">Worker Allocation Targets (% or task count)</span>
+                {approvedNodes.length === 0 ? <small className="muted">No approved workers in cluster.</small> : approvedNodes.map((n) => (
+                  <div key={n.id} className="allocation-item">
+                    <span>{n.node_name} ({n.gpu_model || "CPU"})</span>
+                    <input
+                      type="number"
+                      min="0"
+                      placeholder="Share / %"
+                      value={allocations[n.id] ?? ""}
+                      onChange={(e) => setAllocations({ ...allocations, [n.id]: Number(e.target.value) })}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+            <label>Task JSON<textarea value={taskJson} onChange={(event) => setTaskJson(event.target.value)} rows={4} /></label>
+            <button className="primary-button" type="submit">Create task-parallel job</button>
+          </form>
+        </section>
+      </div>
+
+      <section className="job-section">
+        <div className="section-heading">
+          <div><span className="eyebrow">Execution history</span><h2>Jobs</h2></div>
+          <button className="icon-button" title="Refresh jobs" onClick={onRefresh}><RefreshCw size={17} /></button>
+        </div>
+        {jobs.length === 0 ? (
+          <div className="empty-state">
+            <Database size={24} />
+            <strong>No jobs yet</strong>
+            <p>Upload a package or use the direct demo task contract to create your first job.</p>
+          </div>
+        ) : (
+          <div className="job-list">
+            {jobs.map((job) => (
+              <div className={`job-row ${selectedJobId === job.id ? "selected" : ""}`} key={job.id} role="button" tabIndex={0} onClick={() => void inspectJob(job.id)} onKeyDown={(event) => { if (event.key === "Enter") void inspectJob(job.id); }}>
+                <div>
+                  <strong>{job.name}</strong>
+                  <span>{job.execution_mode} · {job.scheduling_policy || "automatic"} · {job.task_count} tasks</span>
+                </div>
+                <div className="job-progress">
+                  <span>{job.succeeded_count}/{job.task_count} complete</span>
+                  <div><i style={{ width: `${job.task_count ? (job.succeeded_count / job.task_count) * 100 : 0}%` }} /></div>
+                </div>
+                <span className={`job-state ${job.state}`}>{job.state}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {selectedJobId && (
+          <div className="task-inspector">
+            <div className="section-heading">
+              <div><span className="eyebrow">Selected job: {selectedJob?.name}</span><h2>Task detail & artifacts</h2></div>
+              <div className="job-controls">
+                {selectedJob?.state === "paused" && <button className="small-button" onClick={() => void controlJob("resume")}>Resume</button>}
+                {(selectedJob?.state === "queued" || selectedJob?.state === "running") && <button className="small-button" onClick={() => void controlJob("pause")}>Pause</button>}
+                {selectedJob && !["completed", "failed", "canceled"].includes(selectedJob.state) && <button className="revoke-button" onClick={() => void controlJob("cancel")}>Cancel job</button>}
+                {selectedJob?.state === "completed" && <button className="small-button" onClick={() => void downloadResult()}><Download size={14} /> Result</button>}
+                <button className="secondary-button" onClick={() => void downloadReport("markdown")}><FileText size={14} /> Report (.md)</button>
+                <button className="secondary-button" onClick={() => void downloadReport("json")}><FileText size={14} /> Report (.json)</button>
+              </div>
+            </div>
+            <div className="task-table">
+              {tasks.map((task) => (
+                <div className="task-row" key={task.id}>
+                  <span>{task.task_key}</span>
+                  <span className={`job-state ${task.state}`}>{task.state}</span>
+                  <span>Att {task.attempt}</span>
+                  <span>{task.assigned_node_id ?? "Unassigned"}</span>
+                  <span>{task.duration_seconds != null ? `${task.duration_seconds}s` : "—"}</span>
+                  <span>{task.error ?? (task.result ? JSON.stringify(task.result) : "No result")}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </section>
+    </>
+  );
+}
+
+function WorkerConsoleView({ token, onError }: { token: string; onError: (message: string) => void }) {
+  const [myNodes, setMyNodes] = useState<Node[]>([]);
+  const [pairingCode, setPairingCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const headers = { Authorization: `Bearer ${token}` };
+
+  async function loadMyNodes() {
+    try {
+      setMyNodes(await api<Node[]>("/api/v1/worker/my-nodes", { headers }));
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "Unable to load worker nodes");
+    }
+  }
+
+  useEffect(() => {
+    void loadMyNodes();
+    const timer = window.setInterval(() => void loadMyNodes(), 5000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  async function drainNode(nodeId: string) {
+    if (!window.confirm("Drain this Worker? It will finish in-flight work and stop taking new leases.")) return;
+    try {
+      await api(`/api/v1/worker/nodes/${nodeId}/drain`, { method: "POST", headers });
+      await loadMyNodes();
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "Unable to drain worker");
+    }
+  }
+
+  return (
+    <section className="worker-console-view">
+      <section className="hero-strip compact-hero">
+        <div>
+          <span className="eyebrow">Worker operator</span>
+          <h2>Local Compute Station</h2>
+          <p>Manage your computer's GPU/CPU contribution to the cluster and disconnect safely.</p>
+        </div>
+        <Cpu size={42} className="hero-accent" />
+      </section>
+
+      <section className="worker-action-card">
+        <div className="card-title">
+          <Wifi size={18} />
+          <div><span className="eyebrow">Agent Startup & Pairing</span><h2>Start Worker Agent CLI</h2></div>
+        </div>
+        <p className="muted">To register and pair this computer as an active Worker, run the following in PowerShell:</p>
+        <div className="allocation-box">
+          <code>
+            $env:NEXORA_MASTER_URL = "http://127.0.0.1:5000"<br />
+            $env:NEXORA_ACCESS_TOKEN = "{token.slice(0, 16)}..."<br />
+            .\scripts\start-worker.ps1 -PairingCode "&lt;pairing-code-from-master&gt;"
+          </code>
+        </div>
+      </section>
+
+      <div className="section-heading">
+        <div><span className="eyebrow">Local Workstations</span><h2>My Connected Nodes</h2></div>
+        <button className="icon-button" title="Refresh my nodes" onClick={() => void loadMyNodes()}><RefreshCw size={17} /></button>
+      </div>
+
+      {myNodes.length === 0 ? (
+        <div className="empty-state">
+          <Cpu size={24} />
+          <strong>No Worker Nodes registered under this account</strong>
+          <p>Obtain a pairing code from the Master, run `start-worker.ps1`, and your machine will appear here.</p>
+        </div>
+      ) : (
+        <div className="node-grid">
+          {myNodes.map((node) => (
+            <article className="node-card" key={node.id}>
+              <div className="node-header">
+                <div className="node-icon"><Cpu size={18} /></div>
+                <div>
+                  <h3>{node.node_name}</h3>
+                  <span>{node.hostname} · {node.private_ipv4 ?? "No IP"}</span>
+                </div>
+                <span className={`status ${node.status}`}>{node.status}</span>
+              </div>
+              <div className="node-gpu">
+                <span>GPU Acceleration</span>
+                <strong>{node.gpu_model ?? "CPU Mode"}</strong>
+                <small>{node.compute_backend ?? "No backend"} · {node.gpu_vram_bytes ? `${(node.gpu_vram_bytes / 1e9).toFixed(1)} GB VRAM` : "VRAM unavailable"}</small>
+              </div>
+              <div className="node-metrics">
+                <Metric label="CPU" value={node.cpu_utilization == null ? "Unavailable" : `${node.cpu_utilization.toFixed(1)}%`} />
+                <Metric label="RAM" value={node.ram_utilization == null ? "Unavailable" : `${node.ram_utilization.toFixed(1)}%`} />
+                <Metric label="Status" value={node.status} tone={node.status === "online" ? "green" : "muted"} />
+              </div>
+              <footer>
+                <span>Cluster: {node.membership_status}</span>
+                {node.status === "online" && (
+                  <button className="drain-btn" onClick={() => void drainNode(node.id)}>Safe Drain</button>
+                )}
+              </footer>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
 }
 
 function NetworkView({ token, onError }: { token: string; onError: (message: string) => void }) {
@@ -83,16 +615,212 @@ function SettingsView({ token, onChanged, onError }: { token: string; onChanged:
 }
 
 function Dashboard({ token, user, onLogout }: { token: string; user: User; onLogout: () => void }) {
-  const headers = { Authorization: `Bearer ${token}` }; const [view, setView] = useState<"overview" | "workloads" | "network" | "audit" | "settings">("overview"); const [clusters, setClusters] = useState<Cluster[]>([]); const [selectedId, setSelectedId] = useState(""); const [nodes, setNodes] = useState<Node[]>([]); const [telemetry, setTelemetry] = useState<Telemetry[]>([]); const [workloads, setWorkloads] = useState<Workload[]>([]); const [jobs, setJobs] = useState<Job[]>([]); const [clusterName, setClusterName] = useState(""); const [pairing, setPairing] = useState<PairingCode | null>(null); const [error, setError] = useState(""); const selected = useMemo(() => clusters.find((cluster) => cluster.id === selectedId), [clusters, selectedId]);
-  async function loadClusters() { try { const result = await api<Cluster[]>("/api/v1/clusters", { headers }); setClusters(result); setSelectedId((current) => current || result[0]?.id || ""); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Unable to load clusters"); } }
-  async function loadNodes() { if (!selectedId) { setNodes([]); setTelemetry([]); return; } try { setNodes(await api<Node[]>(`/api/v1/clusters/${selectedId}/nodes`, { headers })); setTelemetry(await api<Telemetry[]>(`/api/v1/clusters/${selectedId}/telemetry`, { headers })); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Unable to load nodes"); } }
-  async function loadWorkloads() { try { setWorkloads(await api<Workload[]>("/api/v1/workloads", { headers })); setJobs(await api<Job[]>("/api/v1/jobs", { headers })); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Unable to load workloads"); } }
-  useEffect(() => { void loadClusters(); void loadWorkloads(); }, []); useEffect(() => { void loadNodes(); const timer = window.setInterval(() => void loadNodes(), 5000); return () => window.clearInterval(timer); }, [selectedId]);
-  async function createCluster(event: React.FormEvent) { event.preventDefault(); if (!clusterName.trim()) return; try { const cluster = await api<Cluster>("/api/v1/clusters", { method: "POST", headers, body: JSON.stringify({ name: clusterName }) }); setClusters((current) => [...current, cluster]); setSelectedId(cluster.id); setClusterName(""); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Unable to create cluster"); } }
-  async function createPairingCode() { if (!selectedId) { setError("Select or create a cluster first"); return; } try { setPairing(await api<PairingCode>(`/api/v1/clusters/${selectedId}/pairing-codes`, { method: "POST", headers })); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Unable to create pairing code"); } }
-  async function approveNode(nodeId: string) { try { await api(`/api/v1/clusters/${selectedId}/members/${nodeId}/approve`, { method: "POST", headers }); await loadNodes(); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Unable to approve node"); } }
-  async function revokeNode(nodeId: string) { if (!window.confirm("Revoke this Worker? It will stop receiving heartbeats and tasks.")) return; try { await api(`/api/v1/clusters/${selectedId}/members/${nodeId}/revoke`, { method: "POST", headers }); await loadNodes(); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Unable to revoke node"); } }
-  return <div className="app-shell"><aside className="sidebar"><div className="logo"><span>N</span><strong>NEXORA</strong></div><div className="side-label">Workspace</div><button className={`nav-item ${view === "overview" ? "active" : ""}`} onClick={() => setView("overview")}><Activity size={17} /> Overview</button><button className={`nav-item ${view === "workloads" ? "active" : ""}`} onClick={() => setView("workloads")}><Database size={17} /> Workloads</button><button className={`nav-item ${view === "network" ? "active" : ""}`} onClick={() => setView("network")}><Network size={17} /> Network map</button><button className={`nav-item ${view === "audit" ? "active" : ""}`} onClick={() => setView("audit")}><ShieldCheck size={17} /> Security log</button><button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={() => setView("settings")}><Settings size={17} /> Settings</button><div className="sidebar-foot"><div className="user-chip"><div className="avatar">{user.full_name[0]}</div><div><strong>{user.full_name}</strong><span>{user.roles.join(" / ")}</span></div></div><button className="icon-button" title="Sign out" onClick={onLogout}><LogOut size={17} /></button></div></aside><main className="content"><header className="topbar"><div><p className="eyebrow">Master console / {view === "overview" ? "live view" : view === "workloads" ? "workloads" : view === "network" ? "network diagnostics" : view === "audit" ? "security log" : "settings"}</p><h1>{selected?.name ?? "Your cluster"}</h1></div><div className="top-actions"><span className="connection"><span className="pulse" /> API connected</span><button className="icon-button" title="Refresh" onClick={() => { void loadNodes(); void loadWorkloads(); }}><RefreshCw size={17} /></button></div></header>{error && <div className="alert">{error}<button onClick={() => setError("")}>Dismiss</button></div>}{pairing && <div className="pairing-panel"><div><span className="eyebrow">Worker pairing code</span><strong>{pairing.code}</strong><span>Expires {new Date(pairing.expires_at).toLocaleTimeString()}</span></div><button className="icon-button" title="Close pairing code" onClick={() => setPairing(null)}>×</button></div>}{view === "overview" ? <NodeOverview nodes={nodes} telemetry={telemetry} jobs={jobs} selectedId={selectedId} clusters={clusters} clusterName={clusterName} setSelectedId={setSelectedId} setClusterName={setClusterName} onCreateCluster={createCluster} onRefresh={() => void loadNodes()} onPair={() => void createPairingCode()} onApprove={(nodeId) => void approveNode(nodeId)} onRevoke={(nodeId) => void revokeNode(nodeId)} /> : view === "workloads" ? <WorkloadsView token={token} clusterId={selectedId} workloads={workloads} jobs={jobs} onRefresh={() => { void loadWorkloads(); }} onError={setError} /> : view === "network" ? <NetworkView token={token} onError={setError} /> : view === "audit" ? <AuditView token={token} onError={setError} /> : <SettingsView token={token} onChanged={onLogout} onError={setError} />}</main></div>;
+  const headers = { Authorization: `Bearer ${token}` };
+  const [view, setView] = useState<"overview" | "workloads" | "worker" | "network" | "audit" | "settings">("overview");
+  const [clusters, setClusters] = useState<Cluster[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [summary, setSummary] = useState<ClusterSummary | null>(null);
+  const [nodes, setNodes] = useState<Node[]>([]);
+  const [telemetry, setTelemetry] = useState<Telemetry[]>([]);
+  const [workloads, setWorkloads] = useState<Workload[]>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [clusterName, setClusterName] = useState("");
+  const [pairing, setPairing] = useState<PairingCode | null>(null);
+  const [error, setError] = useState("");
+  const selected = useMemo(() => clusters.find((cluster) => cluster.id === selectedId), [clusters, selectedId]);
+
+  async function loadClusters() {
+    try {
+      const result = await api<Cluster[]>("/api/v1/clusters", { headers });
+      setClusters(result);
+      setSelectedId((current) => current || result[0]?.id || "");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to load clusters");
+    }
+  }
+
+  async function loadNodes() {
+    if (!selectedId) {
+      setNodes([]); setTelemetry([]); setSummary(null); return;
+    }
+    try {
+      setNodes(await api<Node[]>(`/api/v1/clusters/${selectedId}/nodes`, { headers }));
+      setTelemetry(await api<Telemetry[]>(`/api/v1/clusters/${selectedId}/telemetry`, { headers }));
+      setSummary(await api<ClusterSummary>(`/api/v1/clusters/${selectedId}/summary`, { headers }).catch(() => null));
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to load nodes");
+    }
+  }
+
+  async function loadWorkloads() {
+    try {
+      setWorkloads(await api<Workload[]>("/api/v1/workloads", { headers }));
+      setJobs(await api<Job[]>("/api/v1/jobs", { headers }));
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to load workloads");
+    }
+  }
+
+  useEffect(() => { void loadClusters(); void loadWorkloads(); }, []);
+  useEffect(() => {
+    void loadNodes();
+    const timer = window.setInterval(() => void loadNodes(), 5000);
+    return () => window.clearInterval(timer);
+  }, [selectedId]);
+
+  async function createCluster(event: React.FormEvent) {
+    event.preventDefault();
+    if (!clusterName.trim()) return;
+    try {
+      const cluster = await api<Cluster>("/api/v1/clusters", { method: "POST", headers, body: JSON.stringify({ name: clusterName }) });
+      setClusters((current) => [...current, cluster]);
+      setSelectedId(cluster.id);
+      setClusterName("");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to create cluster");
+    }
+  }
+
+  async function createPairingCode() {
+    if (!selectedId) { setError("Select or create a cluster first"); return; }
+    try {
+      setPairing(await api<PairingCode>(`/api/v1/clusters/${selectedId}/pairing-codes`, { method: "POST", headers }));
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to create pairing code");
+    }
+  }
+
+  async function approveNode(nodeId: string) {
+    try {
+      await api(`/api/v1/clusters/${selectedId}/members/${nodeId}/approve`, { method: "POST", headers });
+      await loadNodes();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to approve node");
+    }
+  }
+
+  async function revokeNode(nodeId: string) {
+    if (!window.confirm("Revoke this Worker? It will stop receiving heartbeats and tasks.")) return;
+    try {
+      await api(`/api/v1/clusters/${selectedId}/members/${nodeId}/revoke`, { method: "POST", headers });
+      await loadNodes();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to revoke node");
+    }
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="logo"><span>N</span><strong>NEXORA</strong></div>
+        <div className="side-label">Workspace</div>
+        <button className={`nav-item ${view === "overview" ? "active" : ""}`} onClick={() => setView("overview")}><Activity size={17} /> Overview</button>
+        <button className={`nav-item ${view === "workloads" ? "active" : ""}`} onClick={() => setView("workloads")}><Database size={17} /> Workloads</button>
+        <button className={`nav-item ${view === "worker" ? "active" : ""}`} onClick={() => setView("worker")}><Cpu size={17} /> Worker Console</button>
+        <button className={`nav-item ${view === "network" ? "active" : ""}`} onClick={() => setView("network")}><Network size={17} /> Network map</button>
+        <button className={`nav-item ${view === "audit" ? "active" : ""}`} onClick={() => setView("audit")}><ShieldCheck size={17} /> Security log</button>
+        <button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={() => setView("settings")}><Settings size={17} /> Settings</button>
+        <div className="sidebar-foot">
+          <div className="user-chip">
+            <div className="avatar">{user.full_name[0]}</div>
+            <div><strong>{user.full_name}</strong><span>{user.roles.join(" / ")}</span></div>
+          </div>
+          <button className="icon-button" title="Sign out" onClick={onLogout}><LogOut size={17} /></button>
+        </div>
+      </aside>
+
+      <main className="content">
+        <header className="topbar">
+          <div>
+            <p className="eyebrow">
+              {view === "overview" ? "Master Console / Live Overview" :
+               view === "workloads" ? "Master Console / Workload & Scheduler" :
+               view === "worker" ? "Worker Operator Console" :
+               view === "network" ? "Network Diagnostics" :
+               view === "audit" ? "Security Log" : "Account Settings"}
+            </p>
+            <h1>{selected?.name ?? "Your cluster"}</h1>
+          </div>
+          <div className="top-actions">
+            <span className="connection"><span className="pulse" /> API connected</span>
+            <button className="icon-button" title="Refresh" onClick={() => { void loadNodes(); void loadWorkloads(); }}><RefreshCw size={17} /></button>
+          </div>
+        </header>
+
+        {error && <div className="alert">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
+
+        {pairing && (
+          <div className="pairing-panel">
+            <div>
+              <span className="eyebrow">Worker pairing code</span>
+              <strong>{pairing.code}</strong>
+              <span>Expires {new Date(pairing.expires_at).toLocaleTimeString()}</span>
+            </div>
+            <button className="icon-button" title="Close pairing code" onClick={() => setPairing(null)}>×</button>
+          </div>
+        )}
+
+        {view === "overview" ? (
+          <NodeOverview
+            nodes={nodes}
+            summary={summary}
+            telemetry={telemetry}
+            jobs={jobs}
+            selectedId={selectedId}
+            clusters={clusters}
+            clusterName={clusterName}
+            setSelectedId={setSelectedId}
+            setClusterName={setClusterName}
+            onCreateCluster={createCluster}
+            onRefresh={() => void loadNodes()}
+            onPair={() => void createPairingCode()}
+            onApprove={(nodeId) => void approveNode(nodeId)}
+            onRevoke={(nodeId) => void revokeNode(nodeId)}
+          />
+        ) : view === "workloads" ? (
+          <WorkloadsView
+            token={token}
+            clusterId={selectedId}
+            nodes={nodes}
+            workloads={workloads}
+            jobs={jobs}
+            onRefresh={() => { void loadWorkloads(); }}
+            onError={setError}
+          />
+        ) : view === "worker" ? (
+          <WorkerConsoleView token={token} onError={setError} />
+        ) : view === "network" ? (
+          <NetworkView token={token} onError={setError} />
+        ) : view === "audit" ? (
+          <AuditView token={token} onError={setError} />
+        ) : (
+          <SettingsView token={token} onChanged={onLogout} onError={setError} />
+        )}
+      </main>
+    </div>
+  );
 }
 
-export default function App() { const [token, setToken] = useState(() => localStorage.getItem("nexora_token")); const [user, setUser] = useState<User | null>(() => { const raw = localStorage.getItem("nexora_user"); return raw ? JSON.parse(raw) as User : null; }); function login(nextToken: string, nextUser: User) { localStorage.setItem("nexora_token", nextToken); localStorage.setItem("nexora_user", JSON.stringify(nextUser)); setToken(nextToken); setUser(nextUser); } async function logout() { if (token) await api("/api/v1/auth/logout", { method: "POST", headers: { Authorization: `Bearer ${token}` } }).catch(() => undefined); localStorage.clear(); setToken(null); setUser(null); } return token && user ? <Dashboard token={token} user={user} onLogout={() => void logout()} /> : <Login onLogin={login} />; }
+export default function App() {
+  const [token, setToken] = useState(() => localStorage.getItem("nexora_token"));
+  const [user, setUser] = useState<User | null>(() => {
+    const raw = localStorage.getItem("nexora_user");
+    return raw ? JSON.parse(raw) as User : null;
+  });
+
+  function login(nextToken: string, nextUser: User) {
+    localStorage.setItem("nexora_token", nextToken);
+    localStorage.setItem("nexora_user", JSON.stringify(nextUser));
+    setToken(nextToken);
+    setUser(nextUser);
+  }
+
+  async function logout() {
+    if (token) await api("/api/v1/auth/logout", { method: "POST", headers: { Authorization: `Bearer ${token}` } }).catch(() => undefined);
+    localStorage.clear();
+    setToken(null);
+    setUser(null);
+  }
+
+  return token && user ? <Dashboard token={token} user={user} onLogout={() => void logout()} /> : <Login onLogin={login} />;
+}

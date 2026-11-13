@@ -8,9 +8,13 @@ The first release is an explicit task-parallel MVP:
 
 - One Master console with dynamically paired Worker Agents.
 - Outbound Worker connections over a configured LAN endpoint.
-- SQLite persistence for local development.
+- SQLite persistence for local development (PostgreSQL migration ready).
 - Versioned workload manifests with an explicit task generator and result contract.
-- Automatic, manual, and hybrid scheduling with leases, bounded retries, and result deduplication.
+- Automatic (dynamic resource-aware), Manual (% or count allocation), and Hybrid scheduling policies.
+- Visual Cluster Topology diagram in Master console showing connection status and active tasks.
+- Downloadable execution reports in both Markdown and JSON with per-node compute metrics.
+- Worker Operator Console with dedicated node overview and safe drainage.
+- Task execution duration metrics (`duration_seconds`, `started_at`, `completed_at`).
 - Actual per-machine hardware and OpenCL capability qualification.
 - CPU fallback reported separately from GPU execution.
 

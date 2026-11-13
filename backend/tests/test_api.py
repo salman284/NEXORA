@@ -362,3 +362,147 @@ def test_workload_upload_rejects_unsafe_archive(client: TestClient):
         files={"file": ("unsafe.zip", archive.getvalue(), "application/zip")},
     )
     assert response.status_code == 400
+
+
+def test_manual_and_hybrid_scheduling_and_job_reports(client: TestClient):
+    master = client.post(
+        "/api/v1/auth/register",
+        json={
+            "full_name": "Scheduler Master",
+            "username": "scheduler-master",
+            "email": "sched-master@example.com",
+            "password": "master password for scheduler test",
+            "roles": ["master"],
+        },
+    ).json()
+    master_headers = {"Authorization": f"Bearer {master['access_token']}"}
+    cluster = client.post("/api/v1/clusters", headers=master_headers, json={"name": "Multi-Worker Cluster"}).json()
+    cluster_id = cluster["id"]
+
+    # Register Worker 1
+    w1_user = client.post(
+        "/api/v1/auth/register",
+        json={
+            "full_name": "Worker One",
+            "username": "worker1",
+            "email": "w1@example.com",
+            "password": "worker one password long",
+            "roles": ["worker_operator"],
+        },
+    ).json()
+    w1_headers = {"Authorization": f"Bearer {w1_user['access_token']}"}
+
+    # Register Worker 2
+    w2_user = client.post(
+        "/api/v1/auth/register",
+        json={
+            "full_name": "Worker Two",
+            "username": "worker2",
+            "email": "w2@example.com",
+            "password": "worker two password long",
+            "roles": ["worker_operator"],
+        },
+    ).json()
+    w2_headers = {"Authorization": f"Bearer {w2_user['access_token']}"}
+
+    # Pair Worker 1
+    p1 = client.post(f"/api/v1/clusters/{cluster_id}/pairing-codes", headers=master_headers).json()
+    node1 = client.post(
+        "/api/v1/pairing/requests",
+        headers=w1_headers,
+        json={"code": p1["code"], "node_name": "GPU-Node-1", "hostname": "gpu-node-1", "cpu_threads": 8, "gpu_model": "Radeon RX 580", "gpu_vram_bytes": 8_000_000_000, "compute_backend": "opencl"},
+    ).json()
+    client.post(f"/api/v1/clusters/{cluster_id}/members/{node1['id']}/approve", headers=master_headers)
+
+    # Pair Worker 2
+    p2 = client.post(f"/api/v1/clusters/{cluster_id}/pairing-codes", headers=master_headers).json()
+    node2 = client.post(
+        "/api/v1/pairing/requests",
+        headers=w2_headers,
+        json={"code": p2["code"], "node_name": "GPU-Node-2", "hostname": "gpu-node-2", "cpu_threads": 8, "gpu_model": "Radeon RX 580", "gpu_vram_bytes": 8_000_000_000, "compute_backend": "opencl"},
+    ).json()
+    client.post(f"/api/v1/clusters/{cluster_id}/members/{node2['id']}/approve", headers=master_headers)
+
+    # Send heartbeats for both
+    client.post(f"/api/v1/worker/nodes/{node1['id']}/heartbeat", headers=w1_headers, json={"status": "online", "cpu_utilization": 15.0, "ram_utilization": 45.0})
+    client.post(f"/api/v1/worker/nodes/{node2['id']}/heartbeat", headers=w2_headers, json={"status": "online", "cpu_utilization": 20.0, "ram_utilization": 50.0})
+
+    # Test Cluster Summary endpoint
+    summary = client.get(f"/api/v1/clusters/{cluster_id}/summary", headers=master_headers)
+    assert summary.status_code == 200
+    sum_data = summary.json()
+    assert sum_data["registered_nodes"] == 2
+    assert sum_data["online_nodes"] == 2
+    assert sum_data["detected_gpus"] == 2
+    assert sum_data["total_vram_bytes"] == 16_000_000_000
+
+    # Test Worker My Nodes endpoint
+    my_nodes = client.get("/api/v1/worker/my-nodes", headers=w1_headers)
+    assert my_nodes.status_code == 200
+    assert len(my_nodes.json()) == 1
+    assert my_nodes.json()[0]["id"] == node1["id"]
+
+    # Create job with Manual scheduling: task 1 pinned to node 1, task 2 pinned to node 2
+    job_res = client.post(
+        "/api/v1/jobs",
+        headers=master_headers,
+        json={
+            "cluster_id": cluster_id,
+            "name": "Manual Distribution Job",
+            "scheduling_policy": "manual",
+            "scheduling_config": {"allocations": {node1["id"]: 1, node2["id"]: 1}},
+            "tasks": [
+                {"task_key": "task-node1", "payload": {"operation": "square", "value": 5}},
+                {"task_key": "task-node2", "payload": {"operation": "square", "value": 10}},
+            ],
+        },
+    )
+    assert job_res.status_code == 201
+    job = job_res.json()
+    assert job["scheduling_policy"] == "manual"
+
+    # Worker 2 tries to lease: MUST receive task-node2 (because task-node1 is pinned to node 1)
+    lease2 = client.post(f"/api/v1/worker/nodes/{node2['id']}/tasks/lease", headers=w2_headers)
+    assert lease2.status_code == 200
+    assert lease2.json()["task"]["task_key"] == "task-node2"
+
+    # Worker 1 tries to lease: MUST receive task-node1
+    lease1 = client.post(f"/api/v1/worker/nodes/{node1['id']}/tasks/lease", headers=w1_headers)
+    assert lease1.status_code == 200
+    assert lease1.json()["task"]["task_key"] == "task-node1"
+
+    # Submit results
+    res1 = client.post(
+        f"/api/v1/worker/tasks/{lease1.json()['task']['id']}/result",
+        headers=w1_headers,
+        json={"lease_token": lease1.json()["lease_token"], "status": "succeeded", "result": {"value": 25}},
+    )
+    assert res1.status_code == 200
+    assert res1.json()["duration_seconds"] is not None
+
+    res2 = client.post(
+        f"/api/v1/worker/tasks/{lease2.json()['task']['id']}/result",
+        headers=w2_headers,
+        json={"lease_token": lease2.json()["lease_token"], "status": "succeeded", "result": {"value": 100}},
+    )
+    assert res2.status_code == 200
+
+    # Verify execution report in JSON
+    report_json = client.get(f"/api/v1/jobs/{job['id']}/report", headers=master_headers)
+    assert report_json.status_code == 200
+    rep = report_json.json()
+    assert rep["state"] == "completed"
+    assert rep["task_count"] == 2
+    assert rep["succeeded_count"] == 2
+    assert len(rep["nodes"]) == 2
+
+    # Verify execution report in Markdown
+    report_md = client.get(f"/api/v1/jobs/{job['id']}/report?format=markdown", headers=master_headers)
+    assert report_md.status_code == 200
+    assert "NEXORA Job Execution Report" in report_md.text
+    assert "Node Contribution Summary" in report_md.text
+
+    # Drain worker node
+    drain_res = client.post(f"/api/v1/worker/nodes/{node1['id']}/drain", headers=w1_headers)
+    assert drain_res.status_code == 200
+    assert drain_res.json()["status"] == "draining"
