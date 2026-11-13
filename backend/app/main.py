@@ -132,7 +132,7 @@ class PairingCodeResponse(BaseModel):
 
 
 class PairingRequest(BaseModel):
-    code: str = Field(min_length=8, max_length=8)
+    code: str | None = Field(default=None, max_length=64)
     node_name: str = Field(min_length=1, max_length=120)
     hostname: str = Field(min_length=1, max_length=255)
     operating_system: str | None = Field(default=None, max_length=160)
@@ -595,19 +595,30 @@ def create_pairing_code(cluster_id: str, user: CurrentUser) -> PairingCodeRespon
 
 @app.post("/api/v1/pairing/requests", response_model=NodeResponse, status_code=status.HTTP_201_CREATED)
 def request_pairing(payload: PairingRequest, user: CurrentUser) -> NodeResponse:
-    if "worker_operator" not in user.roles:
-        raise HTTPException(status_code=403, detail="Worker Operator role required")
     now = utc_now()
     with connection_scope() as connection:
-        pairing = connection.execute(
-            """
-            SELECT * FROM pairing_codes
-            WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?
-            """,
-            (hash_token(payload.code.upper()), timestamp(now)),
-        ).fetchone()
-        if pairing is None:
-            raise HTTPException(status_code=400, detail="Pairing code is invalid, expired, or already used")
+        cluster_id = None
+        pairing_id = None
+        if payload.code and payload.code.strip():
+            pairing = connection.execute(
+                """
+                SELECT * FROM pairing_codes
+                WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?
+                """,
+                (hash_token(payload.code.strip().upper()), timestamp(now)),
+            ).fetchone()
+            if pairing is None:
+                raise HTTPException(status_code=400, detail="Pairing code is invalid, expired, or already used")
+            cluster_id = pairing["cluster_id"]
+            pairing_id = pairing["id"]
+        else:
+            cluster = connection.execute(
+                "SELECT id FROM clusters WHERE status = 'active' ORDER BY created_at ASC LIMIT 1"
+            ).fetchone()
+            if cluster is None:
+                raise HTTPException(status_code=400, detail="No active cluster found to accept join request")
+            cluster_id = cluster["id"]
+
         node_id = str(uuid.uuid4())
         connection.execute(
             """
@@ -619,9 +630,10 @@ def request_pairing(payload: PairingRequest, user: CurrentUser) -> NodeResponse:
             """,
             (node_id, user.id, payload.node_name, payload.hostname, payload.operating_system, payload.private_ipv4, payload.cpu_model, payload.cpu_threads, payload.ram_total_bytes, payload.gpu_vendor, payload.gpu_model, payload.gpu_vram_bytes, payload.compute_backend, timestamp(now), timestamp(now)),
         )
-        connection.execute("INSERT INTO cluster_members(cluster_id, node_id) VALUES (?, ?)", (pairing["cluster_id"], node_id))
-        connection.execute("UPDATE pairing_codes SET used_at = ? WHERE id = ?", (timestamp(now), pairing["id"]))
-        record_audit(connection, user.id, "pairing.requested", "node", node_id, "success", {"cluster_id": pairing["cluster_id"]})
+        connection.execute("INSERT INTO cluster_members(cluster_id, node_id, status) VALUES (?, ?, 'pending')", (cluster_id, node_id))
+        if pairing_id:
+            connection.execute("UPDATE pairing_codes SET used_at = ? WHERE id = ?", (timestamp(now), pairing_id))
+        record_audit(connection, user.id, "pairing.requested", "node", node_id, "success", {"cluster_id": cluster_id})
         row = connection.execute(
             """
             SELECT nodes.*, cluster_members.status AS membership_status
