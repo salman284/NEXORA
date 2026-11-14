@@ -90,8 +90,10 @@ def main() -> None:
     client = MasterClient(args.master_url, args.token)
     node_id = args.node_id
     if not node_id:
+        if not args.pairing_code:
+            raise SystemExit("--pairing-code (or NEXORA_PAIRING_CODE) is required when --node-id is not provided")
         inventory = collect_inventory()
-        payload = inventory_pairing_payload(args.pairing_code or "", inventory)
+        payload = inventory_pairing_payload(args.pairing_code, inventory)
         if args.node_name:
             payload["node_name"] = args.node_name
             payload["hostname"] = args.node_name
