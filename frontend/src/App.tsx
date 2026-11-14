@@ -753,8 +753,11 @@ function SettingsView({ token, onChanged, onError }: { token: string; onChanged:
 }
 
 function Dashboard({ token, user, onLogout }: { token: string; user: User; onLogout: () => void }) {
+  const isMaster = user.roles.includes("master");
   const headers = { Authorization: `Bearer ${token}` };
-  const [view, setView] = useState<"overview" | "workloads" | "worker" | "network" | "audit" | "settings">("overview");
+  const [view, setView] = useState<"overview" | "workloads" | "worker" | "network" | "audit" | "settings">(
+    isMaster ? "overview" : "worker"
+  );
   const [clusters, setClusters] = useState<Cluster[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [summary, setSummary] = useState<ClusterSummary | null>(null);
@@ -851,12 +854,18 @@ function Dashboard({ token, user, onLogout }: { token: string; user: User; onLog
     <div className="app-shell">
       <aside className="sidebar">
         <div className="logo"><span>N</span><strong>NEXORA</strong></div>
-        <div className="side-label">Workspace</div>
-        <button className={`nav-item ${view === "overview" ? "active" : ""}`} onClick={() => setView("overview")}><Activity size={17} /> Overview</button>
-        <button className={`nav-item ${view === "workloads" ? "active" : ""}`} onClick={() => setView("workloads")}><Database size={17} /> Workloads</button>
+        <div className="side-label">{isMaster ? "Master Workspace" : "Worker Station"}</div>
+        {isMaster && (
+          <>
+            <button className={`nav-item ${view === "overview" ? "active" : ""}`} onClick={() => setView("overview")}><Activity size={17} /> Overview</button>
+            <button className={`nav-item ${view === "workloads" ? "active" : ""}`} onClick={() => setView("workloads")}><Database size={17} /> Workloads & Jobs</button>
+          </>
+        )}
         <button className={`nav-item ${view === "worker" ? "active" : ""}`} onClick={() => setView("worker")}><Cpu size={17} /> Worker Console</button>
         <button className={`nav-item ${view === "network" ? "active" : ""}`} onClick={() => setView("network")}><Network size={17} /> Network map</button>
-        <button className={`nav-item ${view === "audit" ? "active" : ""}`} onClick={() => setView("audit")}><ShieldCheck size={17} /> Security log</button>
+        {isMaster && (
+          <button className={`nav-item ${view === "audit" ? "active" : ""}`} onClick={() => setView("audit")}><ShieldCheck size={17} /> Security log</button>
+        )}
         <button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={() => setView("settings")}><Settings size={17} /> Settings</button>
         <div className="sidebar-foot">
           <div className="user-chip">
@@ -871,11 +880,13 @@ function Dashboard({ token, user, onLogout }: { token: string; user: User; onLog
         <header className="topbar">
           <div>
             <p className="eyebrow">
-              {view === "overview" ? "Master Console / Live Overview" :
-               view === "workloads" ? "Master Console / Workload & Scheduler" :
-               view === "worker" ? "Worker Operator Console" :
-               view === "network" ? "Network Diagnostics" :
-               view === "audit" ? "Security Log" : "Account Settings"}
+              {isMaster ? "Master Console" : "Worker Operator"} / {
+                view === "overview" ? "Live Overview" :
+                view === "workloads" ? "Workload & Scheduler" :
+                view === "worker" ? "Local Compute Station" :
+                view === "network" ? "Network Diagnostics" :
+                view === "audit" ? "Security Log" : "Account Settings"
+              }
             </p>
             <h1>{selected?.name ?? "Your cluster"}</h1>
           </div>
