@@ -586,3 +586,8 @@ def test_manual_and_hybrid_scheduling_and_job_reports(client: TestClient):
     drain_res = client.post(f"/api/v1/worker/nodes/{node1['id']}/drain", headers=w1_headers)
     assert drain_res.status_code == 200
     assert drain_res.json()["status"] == "draining"
+
+    # Verify worker download-agent endpoint
+    dl_res = client.get("/api/v1/worker/download-agent")
+    assert dl_res.status_code == 200
+    assert "NEXORA-Worker.exe" in dl_res.headers.get("content-disposition", "")

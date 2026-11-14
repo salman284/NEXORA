@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -954,6 +955,19 @@ def drain_worker_node(node_id: str, user: CurrentUser) -> NodeResponse:
         m = db.cluster_members.find_one({"node_id": node_id})
         ms = m["status"] if m else "unpaired"
     return node_response(node_doc, ms)
+
+
+@app.get("/api/v1/worker/download-agent")
+def download_worker_agent() -> FileResponse:
+    dist_dir = Path(__file__).resolve().parent.parent.parent / "dist"
+    exe_path = dist_dir / "NEXORA-Worker.exe"
+    if exe_path.is_file():
+        return FileResponse(
+            exe_path,
+            media_type="application/vnd.microsoft.portable-executable",
+            filename="NEXORA-Worker.exe",
+        )
+    raise HTTPException(status_code=404, detail="NEXORA-Worker.exe executable build not found on server")
 
 
 # ---------------------------------------------------------------------------

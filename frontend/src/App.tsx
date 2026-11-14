@@ -566,12 +566,30 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
   );
 }
 
-function WorkerConsoleView({ token, onError }: { token: string; onError: (message: string) => void }) {
+function WorkerConsoleView({
+  token,
+  user,
+  clusters = [],
+  selectedClusterId = "",
+  onError,
+}: {
+  token: string;
+  user?: User;
+  clusters?: Cluster[];
+  selectedClusterId?: string;
+  onError: (message: string) => void;
+}) {
   const [myNodes, setMyNodes] = useState<Node[]>([]);
-  const [masterHost, setMasterHost] = useState(typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1" ? window.location.hostname : "10.229.205.230");
-  const [pairingCode, setPairingCode] = useState("5A0C1B8F");
-  const [nodeName, setNodeName] = useState("Souvik-PC");
-  const [copied, setCopied] = useState(false);
+  const currentHost = typeof window !== "undefined" && window.location.hostname ? window.location.hostname : "127.0.0.1";
+  const currentPort = typeof window !== "undefined" && window.location.port ? window.location.port : "5000";
+  const [masterHost, setMasterHost] = useState(currentHost);
+  const [masterPort, setMasterPort] = useState(currentPort);
+  const [detectedIps, setDetectedIps] = useState<string[]>([]);
+  const [pairingCode, setPairingCode] = useState("");
+  const [codeExpiresAt, setCodeExpiresAt] = useState<string | null>(null);
+  const [isGeneratingCode, setIsGeneratingCode] = useState(false);
+  const [copiedUrl, setCopiedUrl] = useState(false);
+  const [copiedCode, setCopiedCode] = useState(false);
   const headers = { Authorization: `Bearer ${token}` };
 
   async function loadMyNodes() {
@@ -581,6 +599,28 @@ function WorkerConsoleView({ token, onError }: { token: string; onError: (messag
       onError(requestError instanceof Error ? requestError.message : "Unable to load worker nodes");
     }
   }
+
+  // Preflight to auto-discover Master's real private LAN IP
+  useEffect(() => {
+    async function detectNetwork() {
+      try {
+        const report = await api<NetworkReport>("/api/v1/network/preflight", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ master_host: null, master_port: Number(masterPort) || 5000 }),
+        });
+        if (report?.local_private_ipv4 && report.local_private_ipv4.length > 0) {
+          setDetectedIps(report.local_private_ipv4);
+          if (masterHost === "localhost" || masterHost === "127.0.0.1") {
+            setMasterHost(report.local_private_ipv4[0]);
+          }
+        }
+      } catch {
+        // Fallback to host
+      }
+    }
+    void detectNetwork();
+  }, []);
 
   useEffect(() => {
     void loadMyNodes();
@@ -598,94 +638,237 @@ function WorkerConsoleView({ token, onError }: { token: string; onError: (messag
     }
   }
 
-  const psCommand = `$env:NEXORA_MASTER_URL = "http://${masterHost}:5000"\n$env:NEXORA_ACCESS_TOKEN = "${token}"\n.\\scripts\\start-worker.ps1 -PairingCode "${pairingCode.trim()}" -NodeName "${nodeName.trim()}"`;
-
-  function copyCommand() {
-    navigator.clipboard.writeText(psCommand);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2500);
+  async function generatePairingCode() {
+    const targetClusterId = selectedClusterId || clusters[0]?.id;
+    if (!targetClusterId) {
+      onError("No active cluster found to generate pairing code. Please create a cluster first in Master Workspace.");
+      return;
+    }
+    setIsGeneratingCode(true);
+    try {
+      const resp = await api<PairingCode>(`/api/v1/clusters/${targetClusterId}/pairing-codes`, {
+        method: "POST",
+        headers,
+      });
+      setPairingCode(resp.code);
+      setCodeExpiresAt(new Date(resp.expires_at).toLocaleTimeString());
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Failed to generate pairing code");
+    } finally {
+      setIsGeneratingCode(false);
+    }
   }
 
-  function downloadBat() {
-    const batContent = `@echo off\r\ncd /d "%~dp0"\r\necho Starting NEXORA Worker Node: ${nodeName}...\r\nset NEXORA_MASTER_URL=http://${masterHost}:5000\r\nset NEXORA_ACCESS_TOKEN=${token}\r\npowershell -ExecutionPolicy Bypass -File .\\scripts\\start-worker.ps1 -MasterUrl "http://${masterHost}:5000" -PairingCode "${pairingCode.trim()}" -NodeName "${nodeName.trim()}"\r\npause\r\n`;
-    const blob = new Blob([batContent], { type: "application/x-bat" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `connect-${nodeName.toLowerCase().replace(/[^a-z0-9]/g, "-") || "worker"}.bat`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  const effectiveHost = masterHost.trim() || currentHost;
+  const effectivePort = masterPort.trim() || currentPort;
+  const masterUrl = `http://${effectiveHost}:${effectivePort}`;
+
+  function copyMasterUrl() {
+    navigator.clipboard.writeText(masterUrl);
+    setCopiedUrl(true);
+    setTimeout(() => setCopiedUrl(false), 2000);
+  }
+
+  function copyCode() {
+    if (!pairingCode) return;
+    navigator.clipboard.writeText(pairingCode);
+    setCopiedCode(true);
+    setTimeout(() => setCopiedCode(false), 2000);
   }
 
   return (
     <section className="worker-console-view">
+      {/* Hero Strip */}
       <section className="hero-strip compact-hero">
         <div>
-          <span className="eyebrow">Worker operator</span>
+          <span className="eyebrow">Worker Operator</span>
           <h2>Local Compute Station</h2>
-          <p>Register your PC and contribute your GPU/CPU power to the NEXORA cluster.</p>
+          <p>Contribute your PC's GPU & CPU compute to the distributed cluster. No programming or developer tools needed.</p>
         </div>
         <Cpu size={42} className="hero-accent" />
       </section>
 
-      <section className="worker-action-card">
-        <div className="card-title">
-          <Wifi size={18} />
-          <div><span className="eyebrow">Quick Connect Station</span><h2>Pair This Computer as a Worker</h2></div>
-        </div>
-        <p className="muted">Enter the details below to generate a 1-click startup script or copy the ready-to-run command:</p>
-
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "12px", margin: "16px 0" }}>
-          <label style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "13px" }}>
-            <span style={{ fontWeight: 600 }}>Master IP Address</span>
-            <input
-              type="text"
-              value={masterHost}
-              onChange={(e) => setMasterHost(e.target.value)}
-              placeholder="10.229.205.230"
-              style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid #333", background: "#111", color: "#fff" }}
-            />
-          </label>
-          <label style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "13px" }}>
-            <span style={{ fontWeight: 600 }}>Pairing Code</span>
-            <input
-              type="text"
-              value={pairingCode}
-              onChange={(e) => setPairingCode(e.target.value)}
-              placeholder="e.g. 5A0C1B8F"
-              style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid #333", background: "#111", color: "#fff" }}
-            />
-          </label>
-          <label style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "13px" }}>
-            <span style={{ fontWeight: 600 }}>Worker Node Name</span>
-            <input
-              type="text"
-              value={nodeName}
-              onChange={(e) => setNodeName(e.target.value)}
-              placeholder="e.g. Souvik-PC"
-              style={{ padding: "8px 12px", borderRadius: "6px", border: "1px solid #333", background: "#111", color: "#fff" }}
-            />
-          </label>
+      {/* Primary 1-Click Desktop App Download Card */}
+      <section className="worker-action-card" style={{ border: "1px solid rgba(56, 189, 248, 0.4)", background: "linear-gradient(135deg, rgba(14, 165, 233, 0.1) 0%, rgba(15, 23, 42, 0.6) 100%)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "16px" }}>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "6px" }}>
+              <span style={{ background: "#38bdf8", color: "#0f172a", fontSize: "11px", fontWeight: 700, padding: "2px 8px", borderRadius: "4px", textTransform: "uppercase" }}>Recommended</span>
+              <h2 style={{ margin: 0, fontSize: "20px", color: "#f8fafc" }}>Standalone Desktop Worker App</h2>
+            </div>
+            <p style={{ margin: "0 0 14px 0", color: "#94a3b8", fontSize: "14px", maxWidth: "620px" }}>
+              The easiest way to connect any PC or laptop. Standalone executable with zero prerequisites — no Python, Git, or command-line setup required. Auto-detects NVIDIA/AMD GPUs and pairs instantly.
+            </p>
+          </div>
+          <a
+            href="/api/v1/worker/download-agent"
+            download="NEXORA-Worker.exe"
+            className="primary-button"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "10px",
+              padding: "14px 24px",
+              fontSize: "15px",
+              fontWeight: 700,
+              borderRadius: "8px",
+              textDecoration: "none",
+              background: "#38bdf8",
+              color: "#0f172a",
+              boxShadow: "0 4px 14px rgba(56, 189, 248, 0.35)",
+            }}
+          >
+            <Download size={20} /> Download NEXORA-Worker.exe (~28 MB)
+          </a>
         </div>
 
-        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", marginBottom: "16px" }}>
-          <button className="primary-button" onClick={downloadBat} type="button" style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
-            <Download size={16} /> Download 1-Click connect.bat
-          </button>
-          <button className="secondary-button" onClick={copyCommand} type="button" style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
-            {copied ? <Check size={16} color="#d3f36b" /> : <Copy size={16} />}
-            {copied ? "Copied to Clipboard!" : "Copy PowerShell Command"}
-          </button>
-        </div>
-
-        <div className="allocation-box">
-          <small style={{ color: "#888", display: "block", marginBottom: "6px" }}>Preview Command:</small>
-          <code>{psCommand}</code>
+        {/* 3 Simple Steps */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "12px", marginTop: "16px", paddingTop: "16px", borderTop: "1px solid rgba(255, 255, 255, 0.08)" }}>
+          <div style={{ background: "rgba(0, 0, 0, 0.3)", padding: "12px 14px", borderRadius: "6px", border: "1px solid rgba(255, 255, 255, 0.05)" }}>
+            <span style={{ color: "#38bdf8", fontWeight: 700, fontSize: "12px" }}>STEP 1</span>
+            <h4 style={{ margin: "4px 0 2px 0", fontSize: "14px", color: "#f1f5f9" }}>Download & Run</h4>
+            <p style={{ margin: 0, fontSize: "12px", color: "#94a3b8" }}>Download the <code>.exe</code> file above and double-click to open. Works on Windows 10 & 11.</p>
+          </div>
+          <div style={{ background: "rgba(0, 0, 0, 0.3)", padding: "12px 14px", borderRadius: "6px", border: "1px solid rgba(255, 255, 255, 0.05)" }}>
+            <span style={{ color: "#38bdf8", fontWeight: 700, fontSize: "12px" }}>STEP 2</span>
+            <h4 style={{ margin: "4px 0 2px 0", fontSize: "14px", color: "#f1f5f9" }}>Enter Connection Details</h4>
+            <p style={{ margin: 0, fontSize: "12px", color: "#94a3b8" }}>Copy the Master URL below and enter your credentials (or leave default for auto-registration).</p>
+          </div>
+          <div style={{ background: "rgba(0, 0, 0, 0.3)", padding: "12px 14px", borderRadius: "6px", border: "1px solid rgba(255, 255, 255, 0.05)" }}>
+            <span style={{ color: "#38bdf8", fontWeight: 700, fontSize: "12px" }}>STEP 3</span>
+            <h4 style={{ margin: "4px 0 2px 0", fontSize: "14px", color: "#f1f5f9" }}>Click Connect</h4>
+            <p style={{ margin: 0, fontSize: "12px", color: "#94a3b8" }}>Your GPU/CPU will be detected automatically and begin contributing compute to the cluster!</p>
+          </div>
         </div>
       </section>
 
+      {/* Connection Credentials Card */}
+      <section className="worker-action-card">
+        <div className="card-title">
+          <Wifi size={18} />
+          <div><span className="eyebrow">Connection Information</span><h2>Master Cluster Credentials</h2></div>
+        </div>
+        <p className="muted">Enter these connection parameters into your Desktop Worker App to pair with this master server:</p>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "16px", margin: "16px 0" }}>
+          {/* Master Server URL Box */}
+          <div style={{ background: "#111827", padding: "14px", borderRadius: "8px", border: "1px solid #1f2937" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+              <span style={{ fontSize: "12px", color: "#94a3b8", fontWeight: 600 }}>MASTER SERVER URL</span>
+              <button
+                type="button"
+                onClick={copyMasterUrl}
+                style={{ display: "inline-flex", alignItems: "center", gap: "4px", fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: copiedUrl ? "#10b981" : "#374151", color: "#fff", border: "none", cursor: "pointer" }}
+              >
+                {copiedUrl ? <Check size={12} /> : <Copy size={12} />}
+                {copiedUrl ? "Copied!" : "Copy"}
+              </button>
+            </div>
+            <code style={{ fontSize: "14px", color: "#38bdf8", wordBreak: "break-all", display: "block", marginBottom: "8px" }}>{masterUrl}</code>
+            {detectedIps.length > 0 && (
+              <div style={{ display: "flex", gap: "5px", flexWrap: "wrap", alignItems: "center" }}>
+                <span style={{ fontSize: "11px", color: "#64748b" }}>Quick IP switch:</span>
+                {detectedIps.map((ip) => (
+                  <button
+                    key={ip}
+                    type="button"
+                    onClick={() => setMasterHost(ip)}
+                    style={{
+                      fontSize: "11px",
+                      padding: "2px 6px",
+                      borderRadius: "4px",
+                      background: masterHost === ip ? "#38bdf8" : "#1e293b",
+                      color: masterHost === ip ? "#0f172a" : "#cbd5e1",
+                      border: "1px solid #334155",
+                      cursor: "pointer",
+                      fontWeight: masterHost === ip ? 700 : 400,
+                    }}
+                  >
+                    {ip}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => setMasterHost("localhost")}
+                  style={{
+                    fontSize: "11px",
+                    padding: "2px 6px",
+                    borderRadius: "4px",
+                    background: masterHost === "localhost" ? "#38bdf8" : "#1e293b",
+                    color: masterHost === "localhost" ? "#0f172a" : "#cbd5e1",
+                    border: "1px solid #334155",
+                    cursor: "pointer",
+                    fontWeight: masterHost === "localhost" ? 700 : 400,
+                  }}
+                >
+                  localhost
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Pairing Code Box */}
+          <div style={{ background: "#111827", padding: "14px", borderRadius: "8px", border: "1px solid #1f2937" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+              <span style={{ fontSize: "12px", color: "#94a3b8", fontWeight: 600 }}>PAIRING CODE (OPTIONAL)</span>
+              <div style={{ display: "flex", gap: "6px" }}>
+                {(clusters.length > 0 || user?.roles.includes("master")) && (
+                  <button
+                    type="button"
+                    onClick={generatePairingCode}
+                    disabled={isGeneratingCode}
+                    title="Generate a fresh, live pairing code"
+                    style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#0284c7", color: "#fff", border: "none", cursor: "pointer" }}
+                  >
+                    {isGeneratingCode ? "..." : "⚡ Generate Code"}
+                  </button>
+                )}
+                {pairingCode && (
+                  <button
+                    type="button"
+                    onClick={copyCode}
+                    style={{ display: "inline-flex", alignItems: "center", gap: "4px", fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: copiedCode ? "#10b981" : "#374151", color: "#fff", border: "none", cursor: "pointer" }}
+                  >
+                    {copiedCode ? <Check size={12} /> : <Copy size={12} />}
+                    {copiedCode ? "Copied!" : "Copy"}
+                  </button>
+                )}
+              </div>
+            </div>
+            {pairingCode ? (
+              <div>
+                <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}>
+                  <code style={{ fontSize: "20px", color: "#4ade80", letterSpacing: "2px", fontWeight: 700 }}>{pairingCode}</code>
+                  <button
+                    type="button"
+                    onClick={() => { setPairingCode(""); setCodeExpiresAt(null); }}
+                    style={{ background: "transparent", border: "none", color: "#94a3b8", fontSize: "11px", cursor: "pointer", textDecoration: "underline" }}
+                  >
+                    Clear (Switch to Open Join)
+                  </button>
+                </div>
+                <small style={{ color: "#64748b", fontSize: "11px" }}>Expires at {codeExpiresAt ?? "in 10 min"}</small>
+              </div>
+            ) : (
+              <div>
+                <div style={{ color: "#4ade80", fontSize: "14px", fontWeight: 600, marginTop: "2px" }}>Open Pairing Active</div>
+                <small style={{ color: "#94a3b8", fontSize: "11px" }}>No pairing code required. The Desktop App will pair directly with the active cluster.</small>
+              </div>
+            )}
+          </div>
+
+          {/* Worker Account Box */}
+          <div style={{ background: "#111827", padding: "14px", borderRadius: "8px", border: "1px solid #1f2937" }}>
+            <span style={{ fontSize: "12px", color: "#94a3b8", fontWeight: 600, display: "block", marginBottom: "6px" }}>YOUR WORKER ACCOUNT</span>
+            <div style={{ fontSize: "14px", color: "#f8fafc", fontWeight: 600 }}>{user?.username ?? "worker1"}</div>
+            <small style={{ color: "#94a3b8", fontSize: "11px", display: "block", marginTop: "4px" }}>
+              Enter your username and password in the Desktop App to link your compute node to your account.
+            </small>
+          </div>
+        </div>
+      </section>
+
+      {/* Connected Workstations */}
       <div className="section-heading">
         <div><span className="eyebrow">Local Workstations</span><h2>My Connected Nodes</h2></div>
         <button className="icon-button" title="Refresh my nodes" onClick={() => void loadMyNodes()}><RefreshCw size={17} /></button>
@@ -694,8 +877,8 @@ function WorkerConsoleView({ token, onError }: { token: string; onError: (messag
       {myNodes.length === 0 ? (
         <div className="empty-state">
           <Cpu size={24} />
-          <strong>No Worker Nodes registered under this account</strong>
-          <p>Download the <code>connect.bat</code> above and run it on this PC. Your machine will appear here and in the Master's cluster.</p>
+          <strong>No Worker Nodes connected under this account</strong>
+          <p>Download <strong>NEXORA-Worker.exe</strong> above and click Connect. Your computer's GPU & CPU will appear here and in the Master's cluster live.</p>
         </div>
       ) : (
         <div className="node-grid">
@@ -888,7 +1071,7 @@ function Dashboard({ token, user, onLogout }: { token: string; user: User; onLog
                 view === "audit" ? "Security Log" : "Account Settings"
               }
             </p>
-            <h1>{selected?.name ?? "Your cluster"}</h1>
+            <h1>{isMaster ? (selected?.name ?? "Your cluster") : "Worker Compute Station"}</h1>
           </div>
           <div className="top-actions">
             <span className="connection"><span className="pulse" /> API connected</span>
@@ -937,7 +1120,13 @@ function Dashboard({ token, user, onLogout }: { token: string; user: User; onLog
             onError={setError}
           />
         ) : view === "worker" ? (
-          <WorkerConsoleView token={token} onError={setError} />
+          <WorkerConsoleView
+            token={token}
+            user={user}
+            clusters={clusters}
+            selectedClusterId={selectedId}
+            onError={setError}
+          />
         ) : view === "network" ? (
           <NetworkView token={token} onError={setError} />
         ) : view === "audit" ? (

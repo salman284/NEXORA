@@ -7,8 +7,8 @@ echo.
 
 cd /d "%~dp0\.."
 
-set /p MASTER_IP="Enter Master IP [Default: 10.229.205.230]: "
-if "%MASTER_IP%"=="" set MASTER_IP=10.229.205.230
+set /p MASTER_IP="Enter Master IP [Default: localhost]: "
+if "%MASTER_IP%"=="" set MASTER_IP=localhost
 
 set /p PAIRING_CODE="Enter Pairing Code (Optional - Press Enter to skip): "
 
