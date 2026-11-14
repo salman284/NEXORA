@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -12,12 +13,28 @@ from backend.app.main import task_is_compatible_with_node
 
 @pytest.fixture()
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    database_path = tmp_path / "test.db"
-    monkeypatch.setenv("NEXORA_DATABASE", str(database_path))
+    # Each test gets its own isolated MongoDB database (dropped after test)
+    test_db_name = f"nexora_test_{uuid.uuid4().hex[:12]}"
+    monkeypatch.setenv("NEXORA_DB_NAME", test_db_name)
+    monkeypatch.setenv("NEXORA_WORKLOAD_STORAGE", str(tmp_path / "workloads"))
+
+    # Reset the mongo_db singleton so each test gets a fresh db reference
+    import backend.app.mongo_db as mongo_db_module
+    mongo_db_module._db = None
+
     from backend.app.main import app
 
     with TestClient(app) as test_client:
         yield test_client
+
+    # Cleanup: drop the test database after each test
+    try:
+        client_obj = mongo_db_module.get_client()
+        client_obj.drop_database(test_db_name)
+    except Exception:
+        pass
+    # Reset singleton again after cleanup
+    mongo_db_module._db = None
 
 
 def test_health(client: TestClient):

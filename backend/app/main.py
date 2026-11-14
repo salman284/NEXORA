@@ -11,11 +11,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
-from .db import connection_scope, initialize_database
+from .mongo_db import connection_scope, initialize_database, utcnow_dt, future_dt
 from .network import preflight
 from .workloads import WorkloadManifest, parse_manifest, validate_archive
 
@@ -77,6 +80,18 @@ def verify_password(password: str, stored_hash: str) -> bool:
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def json_hash(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models (unchanged)
+# ---------------------------------------------------------------------------
 
 class RegisterRequest(BaseModel):
     full_name: str = Field(min_length=1, max_length=160)
@@ -341,6 +356,10 @@ class AuditEventResponse(BaseModel):
     created_at: datetime
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "master-api"}
@@ -350,81 +369,232 @@ def workload_storage_path() -> Path:
     return Path(os.getenv("NEXORA_WORKLOAD_STORAGE", "backend/data/workloads"))
 
 
-def workload_response(row) -> WorkloadResponse:
+def _parse_dt(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    dt = datetime.fromisoformat(str(value))
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def node_response(node_doc: dict, membership_status: str) -> NodeResponse:
+    hb = node_doc.get("last_heartbeat_at")
+    return NodeResponse(
+        id=node_doc["node_id"],
+        node_name=node_doc["node_name"],
+        hostname=node_doc["hostname"],
+        status=node_doc.get("status", "offline"),
+        membership_status=membership_status,
+        operating_system=node_doc.get("operating_system"),
+        private_ipv4=node_doc.get("private_ipv4"),
+        gpu_vendor=node_doc.get("gpu_vendor"),
+        gpu_model=node_doc.get("gpu_model"),
+        gpu_vram_bytes=node_doc.get("gpu_vram_bytes"),
+        compute_backend=node_doc.get("compute_backend"),
+        cpu_utilization=node_doc.get("cpu_utilization"),
+        ram_utilization=node_doc.get("ram_utilization"),
+        gpu_utilization=node_doc.get("gpu_utilization"),
+        gpu_used_vram_bytes=node_doc.get("gpu_used_vram_bytes"),
+        last_heartbeat_at=_parse_dt(hb),
+    )
+
+
+def task_response(doc: dict) -> TaskResponse:
+    return TaskResponse(
+        id=doc["task_id"],
+        job_id=doc["job_id"],
+        task_key=doc["task_key"],
+        payload=json.loads(doc["payload_json"]),
+        state=doc["state"],
+        attempt=doc.get("attempt", 0),
+        assigned_node_id=doc.get("assigned_node_id"),
+        pinned_node_id=doc.get("pinned_node_id"),
+        started_at=_parse_dt(doc.get("started_at")),
+        completed_at=_parse_dt(doc.get("completed_at")),
+        duration_seconds=doc.get("duration_seconds"),
+        lease_expires_at=_parse_dt(doc.get("lease_expires_at")),
+        next_retry_at=_parse_dt(doc.get("next_retry_at")),
+        result=json.loads(doc["result_json"]) if doc.get("result_json") else None,
+        result_hash=doc.get("result_hash"),
+        error=doc.get("error"),
+    )
+
+
+def job_response(db, doc: dict) -> JobResponse:
+    job_id = doc["job_id"]
+    pipeline = [
+        {"$match": {"job_id": job_id}},
+        {"$group": {"_id": "$state", "count": {"$sum": 1}}},
+    ]
+    state_counts: dict[str, int] = {}
+    for item in db.tasks.aggregate(pipeline):
+        state_counts[item["_id"]] = item["count"]
+    return JobResponse(
+        id=doc["job_id"],
+        cluster_id=doc["cluster_id"],
+        workload_id=doc.get("workload_id"),
+        name=doc["name"],
+        execution_mode=doc["execution_mode"],
+        scheduling_policy=doc.get("scheduling_policy", "automatic"),
+        scheduling_config=json.loads(doc.get("scheduling_config_json", "{}")),
+        priority=doc.get("priority", 0),
+        state=doc["state"],
+        retry_limit=doc.get("retry_limit", 2),
+        lease_seconds=doc.get("lease_seconds", 60),
+        task_count=sum(state_counts.values()),
+        succeeded_count=state_counts.get("succeeded", 0),
+        failed_count=state_counts.get("failed", 0),
+        queued_count=state_counts.get("queued", 0),
+        created_at=_parse_dt(doc["created_at"]),
+        updated_at=_parse_dt(doc["updated_at"]),
+    )
+
+
+def workload_response(doc: dict) -> WorkloadResponse:
     return WorkloadResponse(
-        id=row["id"],
-        name=row["name"],
-        content_hash=row["content_hash"],
-        size_bytes=row["size_bytes"],
-        validation_state=row["validation_state"],
-        manifest=WorkloadManifest.model_validate(json.loads(row["manifest_json"])),
-        created_at=datetime.fromisoformat(row["created_at"]),
+        id=doc["workload_id"],
+        name=doc["name"],
+        content_hash=doc["content_hash"],
+        size_bytes=doc["size_bytes"],
+        validation_state=doc["validation_state"],
+        manifest=WorkloadManifest.model_validate(json.loads(doc["manifest_json"])),
+        created_at=_parse_dt(doc["created_at"]),
     )
 
 
-def record_audit(connection, actor_id: str | None, action: str, scope_type: str, scope_id: str | None, outcome: str, metadata: dict[str, Any] | None = None) -> None:
-    connection.execute(
-        "INSERT INTO audit_events(id, actor_id, action, scope_type, scope_id, outcome, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (str(uuid.uuid4()), actor_id, action, scope_type, scope_id, outcome, canonical_json(metadata or {}), timestamp(utc_now())),
-    )
-
-
-def audit_response(row) -> AuditEventResponse:
+def audit_response(doc: dict) -> AuditEventResponse:
     return AuditEventResponse(
-        id=row["id"],
-        action=row["action"],
-        scope_type=row["scope_type"],
-        scope_id=row["scope_id"],
-        outcome=row["outcome"],
-        metadata=json.loads(row["metadata_json"]),
-        created_at=datetime.fromisoformat(row["created_at"]),
+        id=doc["event_id"],
+        action=doc["action"],
+        scope_type=doc["scope_type"],
+        scope_id=doc.get("scope_id"),
+        outcome=doc["outcome"],
+        metadata=json.loads(doc.get("metadata_json", "{}")),
+        created_at=_parse_dt(doc["created_at"]),
     )
 
 
-def user_response(connection, user_row) -> UserResponse:
-    roles = [row["role"] for row in connection.execute("SELECT role FROM roles WHERE user_id = ?", (user_row["id"],))]
+def record_audit(db, actor_id: str | None, action: str, scope_type: str, scope_id: str | None, outcome: str, metadata: dict[str, Any] | None = None) -> None:
+    db.audit_events.insert_one({
+        "event_id": str(uuid.uuid4()),
+        "actor_id": actor_id,
+        "action": action,
+        "scope_type": scope_type,
+        "scope_id": scope_id,
+        "outcome": outcome,
+        "metadata_json": canonical_json(metadata or {}),
+        "created_at": utc_now(),
+    })
+
+
+def user_response_from_doc(doc: dict) -> UserResponse:
     return UserResponse(
-        id=user_row["id"],
-        full_name=user_row["full_name"],
-        username=user_row["username"],
-        email=user_row["email"],
-        organization=user_row["organization"],
-        roles=roles,
+        id=doc["user_id"],
+        full_name=doc["full_name"],
+        username=doc["username"],
+        email=doc["email"],
+        organization=doc.get("organization"),
+        roles=doc.get("roles", []),
     )
 
 
-def create_session(connection, user_id: str) -> tuple[str, datetime]:
+def create_session(db, user_id: str) -> tuple[str, datetime]:
     raw_token = secrets.token_urlsafe(32)
     now = utc_now()
     expires_at = now + timedelta(days=SESSION_DAYS)
-    connection.execute(
-        "INSERT INTO sessions(token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
-        (hash_token(raw_token), user_id, timestamp(expires_at), timestamp(now)),
-    )
+    db.sessions.insert_one({
+        "token_hash": hash_token(raw_token),
+        "user_id": user_id,
+        "expires_at": expires_at,
+        "revoked_at": None,
+        "created_at": now,
+    })
     return raw_token, expires_at
 
+
+def node_has_fresh_heartbeat(node_doc: dict, now: datetime) -> bool:
+    if node_doc.get("status") != "online":
+        return False
+    hb = node_doc.get("last_heartbeat_at")
+    if not hb:
+        return False
+    hb_dt = _parse_dt(hb)
+    if hb_dt is None:
+        return False
+    if hb_dt.tzinfo is None:
+        hb_dt = hb_dt.replace(tzinfo=timezone.utc)
+    return hb_dt >= now - timedelta(seconds=HEARTBEAT_STALE_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Auth Guards
+# ---------------------------------------------------------------------------
 
 def current_user(authorization: Annotated[str | None, Header()] = None) -> UserResponse:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer token required")
     token = authorization[7:].strip()
-    with connection_scope() as connection:
-        row = connection.execute(
-            """
-            SELECT users.* FROM sessions
-            JOIN users ON users.id = sessions.user_id
-            WHERE sessions.token_hash = ? AND sessions.revoked_at IS NULL
-              AND users.is_active = 1 AND sessions.expires_at > ?
-            """,
-            (hash_token(token), timestamp(utc_now())),
-        ).fetchone()
-        if row is None:
+    with connection_scope() as db:
+        token_hash = hash_token(token)
+        now = utc_now()
+        session = db.sessions.find_one({
+            "token_hash": token_hash,
+            "revoked_at": None,
+            "expires_at": {"$gt": now},
+        })
+        if session is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired session")
-        return user_response(connection, row)
+        user_doc = db.users.find_one({"user_id": session["user_id"], "is_active": True})
+        if user_doc is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        return user_response_from_doc(user_doc)
 
 
 CurrentUser = Annotated[UserResponse, Depends(current_user)]
 
+
+def require_master_cluster(db, cluster_id: str, user: UserResponse) -> dict:
+    if "master" not in user.roles:
+        raise HTTPException(status_code=403, detail="Master role required")
+    cluster = db.clusters.find_one({"cluster_id": cluster_id, "owner_id": user.id})
+    if cluster is None:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    return cluster
+
+
+def require_worker_node(db, node_id: str, user: UserResponse) -> dict:
+    if "worker_operator" not in user.roles:
+        raise HTTPException(status_code=403, detail="Worker Operator role required")
+    node = db.nodes.find_one({"node_id": node_id, "owner_id": user.id})
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return node
+
+
+def require_master_job(db, job_id: str, user: UserResponse) -> dict:
+    if "master" not in user.roles:
+        raise HTTPException(status_code=403, detail="Master role required")
+    doc = db.jobs.find_one({"job_id": job_id, "owner_id": user.id})
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return doc
+
+
+def require_master_workload(db, workload_id: str, user: UserResponse) -> dict:
+    doc = db.workloads.find_one({"workload_id": workload_id, "owner_id": user.id, "validation_state": "validated"})
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Validated workload not found")
+    return doc
+
+
+# ---------------------------------------------------------------------------
+# Network / Audit
+# ---------------------------------------------------------------------------
 
 @app.post("/api/v1/network/preflight")
 def network_preflight(payload: NetworkPreflightRequest, user: CurrentUser) -> dict[str, Any]:
@@ -435,13 +605,14 @@ def network_preflight(payload: NetworkPreflightRequest, user: CurrentUser) -> di
 
 @app.get("/api/v1/audit-events", response_model=list[AuditEventResponse])
 def list_audit_events(user: CurrentUser) -> list[AuditEventResponse]:
-    with connection_scope() as connection:
-        rows = connection.execute(
-            "SELECT * FROM audit_events WHERE actor_id = ? ORDER BY created_at DESC LIMIT 200",
-            (user.id,),
-        ).fetchall()
-    return [audit_response(row) for row in rows]
+    with connection_scope() as db:
+        docs = list(db.audit_events.find({"actor_id": user.id}).sort("created_at", -1).limit(200))
+    return [audit_response(doc) for doc in docs]
 
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
 
 @app.post("/api/v1/auth/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest) -> AuthResponse:
@@ -449,46 +620,54 @@ def register(payload: RegisterRequest) -> AuthResponse:
     if not requested_roles or not requested_roles.issubset({"master", "worker_operator"}):
         raise HTTPException(status_code=400, detail="roles must be master and/or worker_operator")
     user_id = str(uuid.uuid4())
-    try:
-        with connection_scope() as connection:
-            connection.execute(
-                """
-                INSERT INTO users(id, full_name, username, email, organization, password_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (user_id, payload.full_name.strip(), payload.username, payload.email, payload.organization, hash_password(payload.password), timestamp(utc_now())),
-            )
-            connection.executemany("INSERT INTO roles(user_id, role) VALUES (?, ?)", [(user_id, role) for role in requested_roles])
-            record_audit(connection, user_id, "account.registered", "user", user_id, "success", {"roles": sorted(requested_roles)})
-            token, expires_at = create_session(connection, user_id)
-            user = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-            return AuthResponse(access_token=token, expires_at=expires_at, user=user_response(connection, user))
-    except Exception as error:
-        if "UNIQUE constraint failed" in str(error):
-            raise HTTPException(status_code=409, detail="Username or email is already registered") from error
-        raise
+    with connection_scope() as db:
+        # Check uniqueness
+        if db.users.find_one({"username": {"$regex": f"^{payload.username}$", "$options": "i"}}):
+            raise HTTPException(status_code=409, detail="Username or email is already registered")
+        if db.users.find_one({"email": {"$regex": f"^{payload.email}$", "$options": "i"}}):
+            raise HTTPException(status_code=409, detail="Username or email is already registered")
+        try:
+            db.users.insert_one({
+                "user_id": user_id,
+                "full_name": payload.full_name.strip(),
+                "username": payload.username,
+                "email": payload.email,
+                "organization": payload.organization,
+                "password_hash": hash_password(payload.password),
+                "roles": sorted(requested_roles),
+                "is_active": True,
+                "created_at": utc_now(),
+            })
+        except Exception as error:
+            if "duplicate key" in str(error).lower() or "E11000" in str(error):
+                raise HTTPException(status_code=409, detail="Username or email is already registered") from error
+            raise
+        record_audit(db, user_id, "account.registered", "user", user_id, "success", {"roles": sorted(requested_roles)})
+        token, expires_at = create_session(db, user_id)
+        user_doc = db.users.find_one({"user_id": user_id})
+        return AuthResponse(access_token=token, expires_at=expires_at, user=user_response_from_doc(user_doc))
 
 
 @app.post("/api/v1/auth/login", response_model=AuthResponse)
 def login(payload: LoginRequest) -> AuthResponse:
-    with connection_scope() as connection:
-        user = connection.execute("SELECT * FROM users WHERE username = ?", (payload.username,)).fetchone()
-        if user is None or not verify_password(payload.password, user["password_hash"]):
+    with connection_scope() as db:
+        user_doc = db.users.find_one({"username": {"$regex": f"^{payload.username}$", "$options": "i"}, "is_active": True})
+        if user_doc is None or not verify_password(payload.password, user_doc["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        token, expires_at = create_session(connection, user["id"])
-        record_audit(connection, user["id"], "auth.login", "user", user["id"], "success")
-        return AuthResponse(access_token=token, expires_at=expires_at, user=user_response(connection, user))
+        token, expires_at = create_session(db, user_doc["user_id"])
+        record_audit(db, user_doc["user_id"], "auth.login", "user", user_doc["user_id"], "success")
+        return AuthResponse(access_token=token, expires_at=expires_at, user=user_response_from_doc(user_doc))
 
 
 @app.post("/api/v1/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(authorization: Annotated[str | None, Header()] = None) -> None:
     if authorization and authorization.lower().startswith("bearer "):
-        with connection_scope() as connection:
-            token_hash = hash_token(authorization[7:].strip())
-            session = connection.execute("SELECT user_id FROM sessions WHERE token_hash = ?", (token_hash,)).fetchone()
-            connection.execute("UPDATE sessions SET revoked_at = ? WHERE token_hash = ?", (timestamp(utc_now()), token_hash))
+        token_hash = hash_token(authorization[7:].strip())
+        with connection_scope() as db:
+            session = db.sessions.find_one({"token_hash": token_hash})
+            db.sessions.update_one({"token_hash": token_hash}, {"$set": {"revoked_at": utc_now()}})
             if session:
-                record_audit(connection, session["user_id"], "auth.logout", "user", session["user_id"], "success")
+                record_audit(db, session["user_id"], "auth.logout", "user", session["user_id"], "success")
 
 
 @app.get("/api/v1/auth/me", response_model=UserResponse)
@@ -500,367 +679,307 @@ def me(user: CurrentUser) -> UserResponse:
 def change_password(payload: ChangePasswordRequest, user: CurrentUser) -> None:
     if payload.current_password == payload.new_password:
         raise HTTPException(status_code=400, detail="New password must differ from current password")
-    with connection_scope() as connection:
-        row = connection.execute("SELECT password_hash FROM users WHERE id = ?", (user.id,)).fetchone()
-        if row is None or not verify_password(payload.current_password, row["password_hash"]):
+    with connection_scope() as db:
+        user_doc = db.users.find_one({"user_id": user.id})
+        if user_doc is None or not verify_password(payload.current_password, user_doc["password_hash"]):
             raise HTTPException(status_code=400, detail="Current password is incorrect")
-        now = timestamp(utc_now())
-        connection.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(payload.new_password), user.id))
-        connection.execute("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", (now, user.id))
-        record_audit(connection, user.id, "auth.password_changed", "user", user.id, "success")
+        db.users.update_one({"user_id": user.id}, {"$set": {"password_hash": hash_password(payload.new_password)}})
+        db.sessions.update_many({"user_id": user.id, "revoked_at": None}, {"$set": {"revoked_at": utc_now()}})
+        record_audit(db, user.id, "auth.password_changed", "user", user.id, "success")
 
+
+# ---------------------------------------------------------------------------
+# Clusters
+# ---------------------------------------------------------------------------
 
 @app.post("/api/v1/clusters", response_model=ClusterResponse, status_code=status.HTTP_201_CREATED)
 def create_cluster(payload: ClusterCreateRequest, user: CurrentUser) -> ClusterResponse:
     if "master" not in user.roles:
         raise HTTPException(status_code=403, detail="Master role required")
     cluster_id = str(uuid.uuid4())
-    created_at = utc_now()
-    with connection_scope() as connection:
-        connection.execute(
-            "INSERT INTO clusters(id, owner_id, name, created_at) VALUES (?, ?, ?, ?)",
-            (cluster_id, user.id, payload.name.strip(), timestamp(created_at)),
-        )
-        record_audit(connection, user.id, "cluster.created", "cluster", cluster_id, "success", {"name": payload.name.strip()})
-    return ClusterResponse(id=cluster_id, name=payload.name.strip(), status="active", created_at=created_at)
+    now = utc_now()
+    with connection_scope() as db:
+        db.clusters.insert_one({
+            "cluster_id": cluster_id,
+            "owner_id": user.id,
+            "name": payload.name.strip(),
+            "status": "active",
+            "created_at": now,
+        })
+        record_audit(db, user.id, "cluster.created", "cluster", cluster_id, "success", {"name": payload.name.strip()})
+    return ClusterResponse(id=cluster_id, name=payload.name.strip(), status="active", created_at=now)
 
 
 @app.get("/api/v1/clusters", response_model=list[ClusterResponse])
 def list_clusters(user: CurrentUser) -> list[ClusterResponse]:
-    with connection_scope() as connection:
-        rows = connection.execute("SELECT * FROM clusters WHERE owner_id = ? ORDER BY created_at", (user.id,)).fetchall()
-    return [ClusterResponse(id=row["id"], name=row["name"], status=row["status"], created_at=datetime.fromisoformat(row["created_at"])) for row in rows]
+    with connection_scope() as db:
+        docs = list(db.clusters.find({"owner_id": user.id}).sort("created_at", 1))
+    return [ClusterResponse(id=d["cluster_id"], name=d["name"], status=d["status"], created_at=_parse_dt(d["created_at"])) for d in docs]
 
 
-def require_master_cluster(connection, cluster_id: str, user: UserResponse):
-    if "master" not in user.roles:
-        raise HTTPException(status_code=403, detail="Master role required")
-    cluster = connection.execute("SELECT * FROM clusters WHERE id = ? AND owner_id = ?", (cluster_id, user.id)).fetchone()
-    if cluster is None:
-        raise HTTPException(status_code=404, detail="Cluster not found")
-    return cluster
-
-
-def require_worker_node(connection, node_id: str, user: UserResponse):
-    if "worker_operator" not in user.roles:
-        raise HTTPException(status_code=403, detail="Worker Operator role required")
-    node = connection.execute("SELECT * FROM nodes WHERE id = ? AND owner_id = ?", (node_id, user.id)).fetchone()
-    if node is None:
-        raise HTTPException(status_code=404, detail="Node not found")
-    return node
-
-
-def node_has_fresh_heartbeat(node, now: datetime) -> bool:
-    if node["status"] != "online" or not node["last_heartbeat_at"]:
-        return False
-    return datetime.fromisoformat(node["last_heartbeat_at"]) >= now - timedelta(seconds=HEARTBEAT_STALE_SECONDS)
-
-
-def node_response(row) -> NodeResponse:
-    heartbeat = row["last_heartbeat_at"]
-    return NodeResponse(
-        id=row["id"],
-        node_name=row["node_name"],
-        hostname=row["hostname"],
-        status=row["status"],
-        membership_status=row["membership_status"],
-        operating_system=row["operating_system"],
-        private_ipv4=row["private_ipv4"],
-        gpu_vendor=row["gpu_vendor"],
-        gpu_model=row["gpu_model"],
-        gpu_vram_bytes=row["gpu_vram_bytes"],
-        compute_backend=row["compute_backend"],
-        cpu_utilization=row["cpu_utilization"],
-        ram_utilization=row["ram_utilization"],
-        gpu_utilization=row["gpu_utilization"],
-        gpu_used_vram_bytes=row["gpu_used_vram_bytes"],
-        last_heartbeat_at=datetime.fromisoformat(heartbeat) if heartbeat else None,
-    )
-
+# ---------------------------------------------------------------------------
+# Pairing
+# ---------------------------------------------------------------------------
 
 @app.post("/api/v1/clusters/{cluster_id}/pairing-codes", response_model=PairingCodeResponse)
 def create_pairing_code(cluster_id: str, user: CurrentUser) -> PairingCodeResponse:
     now = utc_now()
     expires_at = now + timedelta(minutes=PAIRING_CODE_MINUTES)
     raw_code = secrets.token_hex(4).upper()
-    with connection_scope() as connection:
-        require_master_cluster(connection, cluster_id, user)
-        connection.execute(
-            "INSERT INTO pairing_codes(id, cluster_id, code_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), cluster_id, hash_token(raw_code), timestamp(expires_at), timestamp(now)),
-        )
-        record_audit(connection, user.id, "pairing.code_created", "cluster", cluster_id, "success", {"expires_at": timestamp(expires_at)})
+    with connection_scope() as db:
+        require_master_cluster(db, cluster_id, user)
+        db.pairing_codes.insert_one({
+            "pairing_id": str(uuid.uuid4()),
+            "cluster_id": cluster_id,
+            "code": raw_code,
+            "code_hash": hash_token(raw_code),
+            "expires_at": expires_at,
+            "used_at": None,
+            "created_at": now,
+        })
+        record_audit(db, user.id, "pairing.code_created", "cluster", cluster_id, "success", {"expires_at": timestamp(expires_at)})
     return PairingCodeResponse(code=raw_code, expires_at=expires_at)
 
 
 @app.post("/api/v1/pairing/requests", response_model=NodeResponse, status_code=status.HTTP_201_CREATED)
 def request_pairing(payload: PairingRequest, user: CurrentUser) -> NodeResponse:
     now = utc_now()
-    with connection_scope() as connection:
+    with connection_scope() as db:
         cluster_id = None
-        pairing_id = None
+        pairing_doc = None
+
         if payload.code and payload.code.strip():
-            pairing = connection.execute(
-                """
-                SELECT * FROM pairing_codes
-                WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?
-                """,
-                (hash_token(payload.code.strip().upper()), timestamp(now)),
-            ).fetchone()
-            if pairing is None:
+            pairing_doc = db.pairing_codes.find_one({
+                "code_hash": hash_token(payload.code.strip().upper()),
+                "used_at": None,
+                "expires_at": {"$gt": now},
+            })
+            if pairing_doc is None:
                 raise HTTPException(status_code=400, detail="Pairing code is invalid, expired, or already used")
-            cluster_id = pairing["cluster_id"]
-            pairing_id = pairing["id"]
+            cluster_id = pairing_doc["cluster_id"]
         else:
-            cluster = connection.execute(
-                "SELECT id FROM clusters WHERE status = 'active' ORDER BY created_at ASC LIMIT 1"
-            ).fetchone()
-            if cluster is None:
+            cluster_doc = db.clusters.find_one({"status": "active"}, sort=[("created_at", -1)])
+            if cluster_doc is None:
                 raise HTTPException(status_code=400, detail="No active cluster found to accept join request")
-            cluster_id = cluster["id"]
+            cluster_id = cluster_doc["cluster_id"]
 
         node_id = str(uuid.uuid4())
-        connection.execute(
-            """
-            INSERT INTO nodes(
-                id, owner_id, node_name, hostname, operating_system, private_ipv4,
-                cpu_model, cpu_threads, ram_total_bytes, gpu_vendor, gpu_model,
-                gpu_vram_bytes, compute_backend, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (node_id, user.id, payload.node_name, payload.hostname, payload.operating_system, payload.private_ipv4, payload.cpu_model, payload.cpu_threads, payload.ram_total_bytes, payload.gpu_vendor, payload.gpu_model, payload.gpu_vram_bytes, payload.compute_backend, timestamp(now), timestamp(now)),
-        )
-        connection.execute("INSERT INTO cluster_members(cluster_id, node_id, status) VALUES (?, ?, 'pending')", (cluster_id, node_id))
-        if pairing_id:
-            connection.execute("UPDATE pairing_codes SET used_at = ? WHERE id = ?", (timestamp(now), pairing_id))
-        record_audit(connection, user.id, "pairing.requested", "node", node_id, "success", {"cluster_id": cluster_id})
-        row = connection.execute(
-            """
-            SELECT nodes.*, cluster_members.status AS membership_status
-            FROM nodes JOIN cluster_members ON cluster_members.node_id = nodes.id
-            WHERE nodes.id = ?
-            """,
-            (node_id,),
-        ).fetchone()
-    return node_response(row)
+        db.nodes.insert_one({
+            "node_id": node_id,
+            "owner_id": user.id,
+            "node_name": payload.node_name,
+            "hostname": payload.hostname,
+            "operating_system": payload.operating_system,
+            "private_ipv4": payload.private_ipv4,
+            "cpu_model": payload.cpu_model,
+            "cpu_threads": payload.cpu_threads,
+            "ram_total_bytes": payload.ram_total_bytes,
+            "gpu_vendor": payload.gpu_vendor,
+            "gpu_model": payload.gpu_model,
+            "gpu_vram_bytes": payload.gpu_vram_bytes,
+            "compute_backend": payload.compute_backend,
+            "status": "offline",
+            "cpu_utilization": None,
+            "ram_utilization": None,
+            "gpu_utilization": None,
+            "gpu_used_vram_bytes": None,
+            "last_heartbeat_at": None,
+            "created_at": now,
+            "updated_at": now,
+        })
+        db.cluster_members.insert_one({
+            "cluster_id": cluster_id,
+            "node_id": node_id,
+            "status": "pending",
+            "approved_at": None,
+            "revoked_at": None,
+        })
+        if pairing_doc:
+            db.pairing_codes.update_one({"pairing_id": pairing_doc["pairing_id"]}, {"$set": {"used_at": now}})
+        record_audit(db, user.id, "pairing.requested", "node", node_id, "success", {"cluster_id": cluster_id})
+        node_doc = db.nodes.find_one({"node_id": node_id})
+    return node_response(node_doc, "pending")
 
 
 @app.post("/api/v1/clusters/{cluster_id}/members/{node_id}/approve", response_model=NodeResponse)
 def approve_node(cluster_id: str, node_id: str, user: CurrentUser) -> NodeResponse:
     now = utc_now()
-    with connection_scope() as connection:
-        require_master_cluster(connection, cluster_id, user)
-        updated = connection.execute(
-            "UPDATE cluster_members SET status = 'approved', approved_at = ?, revoked_at = NULL WHERE cluster_id = ? AND node_id = ? AND status = 'pending'",
-            (timestamp(now), cluster_id, node_id),
+    with connection_scope() as db:
+        require_master_cluster(db, cluster_id, user)
+        result = db.cluster_members.update_one(
+            {"cluster_id": cluster_id, "node_id": node_id, "status": "pending"},
+            {"$set": {"status": "approved", "approved_at": now, "revoked_at": None}},
         )
-        if updated.rowcount != 1:
+        if result.modified_count != 1:
             raise HTTPException(status_code=404, detail="Pending node membership not found")
-        record_audit(connection, user.id, "node.approved", "node", node_id, "success", {"cluster_id": cluster_id})
-        row = connection.execute(
-            """
-            SELECT nodes.*, cluster_members.status AS membership_status
-            FROM nodes JOIN cluster_members ON cluster_members.node_id = nodes.id
-            WHERE nodes.id = ? AND cluster_members.cluster_id = ?
-            """,
-            (node_id, cluster_id),
-        ).fetchone()
-    return node_response(row)
+        record_audit(db, user.id, "node.approved", "node", node_id, "success", {"cluster_id": cluster_id})
+        node_doc = db.nodes.find_one({"node_id": node_id})
+    return node_response(node_doc, "approved")
 
 
 @app.post("/api/v1/clusters/{cluster_id}/members/{node_id}/revoke", response_model=NodeResponse)
 def revoke_node(cluster_id: str, node_id: str, user: CurrentUser) -> NodeResponse:
     now = utc_now()
-    with connection_scope() as connection:
-        require_master_cluster(connection, cluster_id, user)
-        updated = connection.execute(
-            "UPDATE cluster_members SET status = 'revoked', revoked_at = ? WHERE cluster_id = ? AND node_id = ? AND status = 'approved'",
-            (timestamp(now), cluster_id, node_id),
+    with connection_scope() as db:
+        require_master_cluster(db, cluster_id, user)
+        result = db.cluster_members.update_one(
+            {"cluster_id": cluster_id, "node_id": node_id, "status": "approved"},
+            {"$set": {"status": "revoked", "revoked_at": now}},
         )
-        if updated.rowcount != 1:
+        if result.modified_count != 1:
             raise HTTPException(status_code=404, detail="Approved node membership not found")
-        connection.execute("UPDATE nodes SET status = 'offline', updated_at = ? WHERE id = ?", (timestamp(now), node_id))
-        record_audit(connection, user.id, "node.revoked", "node", node_id, "success", {"cluster_id": cluster_id})
-        row = connection.execute(
-            """
-            SELECT nodes.*, cluster_members.status AS membership_status
-            FROM nodes JOIN cluster_members ON cluster_members.node_id = nodes.id
-            WHERE nodes.id = ? AND cluster_members.cluster_id = ?
-            """,
-            (node_id, cluster_id),
-        ).fetchone()
-    return node_response(row)
+        db.nodes.update_one({"node_id": node_id}, {"$set": {"status": "offline", "updated_at": now}})
+        record_audit(db, user.id, "node.revoked", "node", node_id, "success", {"cluster_id": cluster_id})
+        node_doc = db.nodes.find_one({"node_id": node_id})
+    return node_response(node_doc, "revoked")
+
+
+# ---------------------------------------------------------------------------
+# Nodes
+# ---------------------------------------------------------------------------
+
+def _mark_stale_nodes_offline(db, cluster_id: str, now: datetime) -> None:
+    stale_cutoff = now - timedelta(seconds=HEARTBEAT_STALE_SECONDS)
+    # find node_ids in this cluster
+    member_ids = [m["node_id"] for m in db.cluster_members.find({"cluster_id": cluster_id})]
+    db.nodes.update_many(
+        {"node_id": {"$in": member_ids}, "status": "online", "last_heartbeat_at": {"$lt": stale_cutoff}},
+        {"$set": {"status": "offline", "updated_at": now}},
+    )
 
 
 @app.get("/api/v1/clusters/{cluster_id}/nodes", response_model=list[NodeResponse])
 def list_nodes(cluster_id: str, user: CurrentUser) -> list[NodeResponse]:
-    with connection_scope() as connection:
-        require_master_cluster(connection, cluster_id, user)
-        connection.execute(
-            """
-            UPDATE nodes SET status = 'offline', updated_at = ?
-            WHERE status = 'online' AND last_heartbeat_at < ?
-              AND id IN (SELECT node_id FROM cluster_members WHERE cluster_id = ?)
-            """,
-            (timestamp(utc_now()), timestamp(utc_now() - timedelta(seconds=HEARTBEAT_STALE_SECONDS)), cluster_id),
-        )
-        rows = connection.execute(
-            """
-            SELECT nodes.*, cluster_members.status AS membership_status
-            FROM nodes JOIN cluster_members ON cluster_members.node_id = nodes.id
-            WHERE cluster_members.cluster_id = ? ORDER BY nodes.created_at
-            """,
-            (cluster_id,),
-        ).fetchall()
-    return [node_response(row) for row in rows]
+    with connection_scope() as db:
+        require_master_cluster(db, cluster_id, user)
+        now = utc_now()
+        _mark_stale_nodes_offline(db, cluster_id, now)
+        members = list(db.cluster_members.find({"cluster_id": cluster_id}))
+        result = []
+        for m in members:
+            node_doc = db.nodes.find_one({"node_id": m["node_id"]})
+            if node_doc:
+                result.append(node_response(node_doc, m["status"]))
+    return result
 
 
 @app.post("/api/v1/worker/nodes/{node_id}/heartbeat", response_model=NodeResponse)
 def heartbeat(node_id: str, payload: HeartbeatRequest, user: CurrentUser) -> NodeResponse:
     now = utc_now()
-    with connection_scope() as connection:
-        node = require_worker_node(connection, node_id, user)
-        membership = connection.execute(
-            "SELECT status FROM cluster_members WHERE node_id = ?", (node_id,)
-        ).fetchone()
+    with connection_scope() as db:
+        require_worker_node(db, node_id, user)
+        membership = db.cluster_members.find_one({"node_id": node_id})
         if membership is None or membership["status"] != "approved":
             raise HTTPException(status_code=403, detail="Node is not approved for a cluster")
-        connection.execute(
-            """
-            UPDATE nodes SET status = ?, cpu_utilization = ?, ram_utilization = ?,
-                gpu_utilization = ?, gpu_used_vram_bytes = ?, last_heartbeat_at = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (payload.status, payload.cpu_utilization, payload.ram_utilization, payload.gpu_utilization, payload.gpu_used_vram_bytes, timestamp(now), timestamp(now), node_id),
+        db.nodes.update_one(
+            {"node_id": node_id},
+            {"$set": {
+                "status": payload.status,
+                "cpu_utilization": payload.cpu_utilization,
+                "ram_utilization": payload.ram_utilization,
+                "gpu_utilization": payload.gpu_utilization,
+                "gpu_used_vram_bytes": payload.gpu_used_vram_bytes,
+                "last_heartbeat_at": now,
+                "updated_at": now,
+            }},
         )
-        connection.execute(
-            "INSERT INTO telemetry_samples(id, node_id, captured_at, source, cpu_utilization, ram_utilization, gpu_utilization, gpu_used_vram_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), node_id, timestamp(now), payload.telemetry_source, payload.cpu_utilization, payload.ram_utilization, payload.gpu_utilization, payload.gpu_used_vram_bytes),
-        )
-        row = connection.execute(
-            """
-            SELECT nodes.*, cluster_members.status AS membership_status
-            FROM nodes JOIN cluster_members ON cluster_members.node_id = nodes.id
-            WHERE nodes.id = ?
-            """,
-            (node_id,),
-        ).fetchone()
-    return node_response(row)
+        db.telemetry_samples.insert_one({
+            "sample_id": str(uuid.uuid4()),
+            "node_id": node_id,
+            "recorded_at": now,
+            "source": payload.telemetry_source,
+            "cpu_utilization": payload.cpu_utilization,
+            "ram_utilization": payload.ram_utilization,
+            "gpu_utilization": payload.gpu_utilization,
+            "gpu_used_vram_bytes": payload.gpu_used_vram_bytes,
+        })
+        node_doc = db.nodes.find_one({"node_id": node_id})
+    return node_response(node_doc, "approved")
 
 
 @app.get("/api/v1/clusters/{cluster_id}/telemetry", response_model=list[TelemetryResponse])
 def list_telemetry(cluster_id: str, user: CurrentUser) -> list[TelemetryResponse]:
-    with connection_scope() as connection:
-        require_master_cluster(connection, cluster_id, user)
-        rows = connection.execute(
-            """
-            SELECT telemetry_samples.*, nodes.node_name
-            FROM telemetry_samples JOIN nodes ON nodes.id = telemetry_samples.node_id
-            JOIN cluster_members ON cluster_members.node_id = nodes.id
-            WHERE cluster_members.cluster_id = ?
-            ORDER BY telemetry_samples.captured_at DESC LIMIT 1000
-            """,
-            (cluster_id,),
-        ).fetchall()
-    return [TelemetryResponse(node_id=row["node_id"], node_name=row["node_name"], captured_at=datetime.fromisoformat(row["captured_at"]), source=row["source"], cpu_utilization=row["cpu_utilization"], ram_utilization=row["ram_utilization"], gpu_utilization=row["gpu_utilization"], gpu_used_vram_bytes=row["gpu_used_vram_bytes"]) for row in rows]
+    with connection_scope() as db:
+        require_master_cluster(db, cluster_id, user)
+        member_ids = [m["node_id"] for m in db.cluster_members.find({"cluster_id": cluster_id})]
+        samples = list(
+            db.telemetry_samples.find({"node_id": {"$in": member_ids}})
+            .sort("recorded_at", -1)
+            .limit(1000)
+        )
+        node_names: dict[str, str] = {}
+        for nid in member_ids:
+            n = db.nodes.find_one({"node_id": nid}, {"node_name": 1})
+            if n:
+                node_names[nid] = n["node_name"]
+    return [
+        TelemetryResponse(
+            node_id=s["node_id"],
+            node_name=node_names.get(s["node_id"], "Unknown"),
+            captured_at=_parse_dt(s["recorded_at"]),
+            source=s.get("source", "worker_agent"),
+            cpu_utilization=s.get("cpu_utilization"),
+            ram_utilization=s.get("ram_utilization"),
+            gpu_utilization=s.get("gpu_utilization"),
+            gpu_used_vram_bytes=s.get("gpu_used_vram_bytes"),
+        )
+        for s in samples
+    ]
 
 
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+# ---------------------------------------------------------------------------
+# Worker node management
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/worker/my-nodes", response_model=list[NodeResponse])
+def list_my_worker_nodes(user: CurrentUser) -> list[NodeResponse]:
+    with connection_scope() as db:
+        nodes = list(db.nodes.find({"owner_id": user.id}).sort("created_at", -1))
+        result = []
+        for node_doc in nodes:
+            m = db.cluster_members.find_one({"node_id": node_doc["node_id"]})
+            ms = m["status"] if m else "unpaired"
+            result.append(node_response(node_doc, ms))
+    return result
 
 
-def json_hash(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode()).hexdigest()
+@app.post("/api/v1/worker/nodes/{node_id}/drain", response_model=NodeResponse)
+def drain_worker_node(node_id: str, user: CurrentUser) -> NodeResponse:
+    now = utc_now()
+    with connection_scope() as db:
+        require_worker_node(db, node_id, user)
+        db.nodes.update_one({"node_id": node_id}, {"$set": {"status": "draining", "updated_at": now}})
+        record_audit(db, user.id, "node.drain", "node", node_id, "success")
+        node_doc = db.nodes.find_one({"node_id": node_id})
+        m = db.cluster_members.find_one({"node_id": node_id})
+        ms = m["status"] if m else "unpaired"
+    return node_response(node_doc, ms)
 
 
-def task_response(row) -> TaskResponse:
-    row_keys = row.keys() if hasattr(row, "keys") else []
-    return TaskResponse(
-        id=row["id"],
-        job_id=row["job_id"],
-        task_key=row["task_key"],
-        payload=json.loads(row["payload_json"]),
-        state=row["state"],
-        attempt=row["attempt"],
-        assigned_node_id=row["assigned_node_id"],
-        pinned_node_id=row["pinned_node_id"] if "pinned_node_id" in row_keys else None,
-        started_at=datetime.fromisoformat(row["started_at"]) if ("started_at" in row_keys and row["started_at"]) else None,
-        completed_at=datetime.fromisoformat(row["completed_at"]) if ("completed_at" in row_keys and row["completed_at"]) else None,
-        duration_seconds=row["duration_seconds"] if "duration_seconds" in row_keys else None,
-        lease_expires_at=datetime.fromisoformat(row["lease_expires_at"]) if row["lease_expires_at"] else None,
-        next_retry_at=datetime.fromisoformat(row["next_retry_at"]) if row["next_retry_at"] else None,
-        result=json.loads(row["result_json"]) if row["result_json"] else None,
-        result_hash=row["result_hash"],
-        error=row["error"],
-    )
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
 
-
-def job_response(connection, row) -> JobResponse:
-    counts = connection.execute(
-        "SELECT state, COUNT(*) AS count FROM tasks WHERE job_id = ? GROUP BY state",
-        (row["id"],),
-    ).fetchall()
-    state_counts = {item["state"]: item["count"] for item in counts}
-    row_keys = row.keys() if hasattr(row, "keys") else []
-    scheduling_policy = row["scheduling_policy"] if "scheduling_policy" in row_keys else "automatic"
-    scheduling_config = (
-        json.loads(row["scheduling_config_json"])
-        if ("scheduling_config_json" in row_keys and row["scheduling_config_json"])
-        else {}
-    )
-    return JobResponse(
-        id=row["id"],
-        cluster_id=row["cluster_id"],
-        workload_id=row["workload_id"],
-        name=row["name"],
-        execution_mode=row["execution_mode"],
-        scheduling_policy=scheduling_policy,
-        scheduling_config=scheduling_config,
-        priority=row["priority"],
-        state=row["state"],
-        retry_limit=row["retry_limit"],
-        lease_seconds=row["lease_seconds"],
-        task_count=sum(state_counts.values()),
-        succeeded_count=state_counts.get("succeeded", 0),
-        failed_count=state_counts.get("failed", 0),
-        queued_count=state_counts.get("queued", 0),
-        created_at=datetime.fromisoformat(row["created_at"]),
-        updated_at=datetime.fromisoformat(row["updated_at"]),
-    )
-
-
-def require_master_job(connection, job_id: str, user: UserResponse):
-    if "master" not in user.roles:
-        raise HTTPException(status_code=403, detail="Master role required")
-    row = connection.execute("SELECT * FROM jobs WHERE id = ? AND owner_id = ?", (job_id, user.id)).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return row
-
-
-def require_master_workload(connection, workload_id: str, user: UserResponse):
-    row = connection.execute(
-        "SELECT * FROM workload_packages WHERE id = ? AND owner_id = ? AND validation_state = 'validated'",
-        (workload_id, user.id),
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Validated workload not found")
-    return row
-
-
-def reconcile_job(connection, job_id: str, now: datetime) -> None:
-    counts = connection.execute("SELECT state, COUNT(*) AS count FROM tasks WHERE job_id = ? GROUP BY state", (job_id,)).fetchall()
-    state_counts = {item["state"]: item["count"] for item in counts}
+def reconcile_job(db, job_id: str, now: datetime) -> None:
+    pipeline = [
+        {"$match": {"job_id": job_id}},
+        {"$group": {"_id": "$state", "count": {"$sum": 1}}},
+    ]
+    state_counts: dict[str, int] = {}
+    for item in db.tasks.aggregate(pipeline):
+        state_counts[item["_id"]] = item["count"]
     total = sum(state_counts.values())
     if state_counts.get("succeeded", 0) == total and total > 0:
-        state = "completed"
-    elif state_counts.get("failed", 0) > 0 and not any(state_counts.get(active, 0) for active in ("queued", "leased", "running", "retrying")):
-        state = "failed"
+        new_state = "completed"
+    elif state_counts.get("failed", 0) > 0 and not any(
+        state_counts.get(s, 0) for s in ("queued", "leased", "running", "retrying")
+    ):
+        new_state = "failed"
     elif state_counts.get("leased", 0) or state_counts.get("running", 0) or state_counts.get("queued", 0):
-        state = "running"
+        new_state = "running"
     else:
         return
-    connection.execute("UPDATE jobs SET state = ?, updated_at = ? WHERE id = ?", (state, timestamp(now), job_id))
+    db.jobs.update_one({"job_id": job_id}, {"$set": {"state": new_state, "updated_at": now}})
 
 
 @app.post("/api/v1/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
@@ -869,9 +988,9 @@ def create_job(payload: JobCreateRequest, user: CurrentUser) -> JobResponse:
     task_keys = [task.task_key for task in payload.tasks]
     if len(task_keys) != len(set(task_keys)):
         raise HTTPException(status_code=400, detail="task_key values must be unique within a job")
-    with connection_scope() as connection:
-        require_master_cluster(connection, payload.cluster_id, user)
-        workload = require_master_workload(connection, payload.workload_id, user) if payload.workload_id else None
+    with connection_scope() as db:
+        require_master_cluster(db, payload.cluster_id, user)
+        workload = require_master_workload(db, payload.workload_id, user) if payload.workload_id else None
         if workload:
             manifest = WorkloadManifest.model_validate(json.loads(workload["manifest_json"]))
             mismatched_tasks = [
@@ -882,7 +1001,7 @@ def create_job(payload: JobCreateRequest, user: CurrentUser) -> JobResponse:
             ]
             if mismatched_tasks:
                 raise HTTPException(status_code=400, detail=f"Tasks do not match workload operation: {mismatched_tasks}")
-        
+
         # Pinned node resolution for Manual / Hybrid scheduling
         pinned_map: dict[str, str | None] = {}
         for task in payload.tasks:
@@ -894,14 +1013,12 @@ def create_job(payload: JobCreateRequest, user: CurrentUser) -> JobResponse:
             total_tasks = len(payload.tasks)
             alloc_sum = sum(v for v in allocations.values() if isinstance(v, (int, float)))
             is_percentage = alloc_sum > 0 and 95 <= alloc_sum <= 105
-            
             task_targets: list[str] = []
-            for node_id, weight in allocations.items():
+            for nid, weight in allocations.items():
                 if not isinstance(weight, (int, float)) or weight <= 0:
                     continue
                 count = int(round((weight / 100.0) * total_tasks)) if is_percentage else int(weight)
-                task_targets.extend([node_id] * count)
-            
+                task_targets.extend([nid] * count)
             target_idx = 0
             for task in payload.tasks:
                 if task.task_key not in pinned_map and target_idx < len(task_targets):
@@ -909,193 +1026,155 @@ def create_job(payload: JobCreateRequest, user: CurrentUser) -> JobResponse:
                     target_idx += 1
 
         job_id = str(uuid.uuid4())
-        connection.execute(
-            """
-            INSERT INTO jobs(
-                id, cluster_id, owner_id, workload_id, name, execution_mode,
-                scheduling_policy, scheduling_config_json, priority, retry_limit,
-                lease_seconds, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                job_id,
-                payload.cluster_id,
-                user.id,
-                payload.workload_id,
-                payload.name.strip(),
-                payload.execution_mode,
-                payload.scheduling_policy,
-                canonical_json(payload.scheduling_config),
-                payload.priority,
-                payload.retry_limit,
-                payload.lease_seconds,
-                timestamp(now),
-                timestamp(now),
-            ),
-        )
-        connection.executemany(
-            """
-            INSERT INTO tasks(id, job_id, task_key, payload_json, payload_hash, pinned_node_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    str(uuid.uuid4()),
-                    job_id,
-                    task.task_key,
-                    canonical_json(task.payload),
-                    json_hash(task.payload),
-                    pinned_map.get(task.task_key),
-                    timestamp(now),
-                    timestamp(now),
-                )
-                for task in payload.tasks
-            ],
-        )
-        record_audit(
-            connection,
-            user.id,
-            "job.created",
-            "job",
-            job_id,
-            "success",
+        db.jobs.insert_one({
+            "job_id": job_id,
+            "cluster_id": payload.cluster_id,
+            "owner_id": user.id,
+            "workload_id": payload.workload_id,
+            "name": payload.name.strip(),
+            "execution_mode": payload.execution_mode,
+            "scheduling_policy": payload.scheduling_policy,
+            "scheduling_config_json": canonical_json(payload.scheduling_config),
+            "priority": payload.priority,
+            "retry_limit": payload.retry_limit,
+            "lease_seconds": payload.lease_seconds,
+            "state": "queued",
+            "created_at": now,
+            "updated_at": now,
+        })
+        db.tasks.insert_many([
             {
-                "task_count": len(payload.tasks),
-                "workload_id": payload.workload_id,
-                "scheduling_policy": payload.scheduling_policy,
-            },
-        )
-        row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        return job_response(connection, row)
+                "task_id": str(uuid.uuid4()),
+                "job_id": job_id,
+                "task_key": task.task_key,
+                "payload_json": canonical_json(task.payload),
+                "payload_hash": json_hash(task.payload),
+                "pinned_node_id": pinned_map.get(task.task_key),
+                "state": "queued",
+                "attempt": 0,
+                "assigned_node_id": None,
+                "lease_token_hash": None,
+                "lease_expires_at": None,
+                "next_retry_at": None,
+                "started_at": None,
+                "completed_at": None,
+                "duration_seconds": None,
+                "result_json": None,
+                "result_hash": None,
+                "error": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+            for task in payload.tasks
+        ])
+        record_audit(db, user.id, "job.created", "job", job_id, "success", {
+            "task_count": len(payload.tasks),
+            "workload_id": payload.workload_id,
+            "scheduling_policy": payload.scheduling_policy,
+        })
+        job_doc = db.jobs.find_one({"job_id": job_id})
+        return job_response(db, job_doc)
 
 
 @app.get("/api/v1/jobs/{job_id}", response_model=JobResponse)
 def get_job(job_id: str, user: CurrentUser) -> JobResponse:
-    with connection_scope() as connection:
-        row = require_master_job(connection, job_id, user)
-        return job_response(connection, row)
+    with connection_scope() as db:
+        doc = require_master_job(db, job_id, user)
+        return job_response(db, doc)
 
 
 @app.get("/api/v1/jobs", response_model=list[JobResponse])
 def list_jobs(user: CurrentUser) -> list[JobResponse]:
-    with connection_scope() as connection:
-        rows = connection.execute("SELECT * FROM jobs WHERE owner_id = ? ORDER BY created_at DESC", (user.id,)).fetchall()
-        return [job_response(connection, row) for row in rows]
+    with connection_scope() as db:
+        docs = list(db.jobs.find({"owner_id": user.id}).sort("created_at", -1))
+        return [job_response(db, d) for d in docs]
 
 
 @app.get("/api/v1/jobs/{job_id}/tasks", response_model=list[TaskResponse])
 def list_tasks(job_id: str, user: CurrentUser) -> list[TaskResponse]:
-    with connection_scope() as connection:
-        require_master_job(connection, job_id, user)
-        rows = connection.execute("SELECT * FROM tasks WHERE job_id = ? ORDER BY task_key", (job_id,)).fetchall()
-    return [task_response(row) for row in rows]
+    with connection_scope() as db:
+        require_master_job(db, job_id, user)
+        docs = list(db.tasks.find({"job_id": job_id}).sort("task_key", 1))
+    return [task_response(d) for d in docs]
 
 
 @app.get("/api/v1/jobs/{job_id}/result", response_model=FinalResultResponse)
 def get_final_result(job_id: str, user: CurrentUser) -> FinalResultResponse:
-    with connection_scope() as connection:
-        job = require_master_job(connection, job_id, user)
-        if job["state"] != "completed":
-            raise HTTPException(status_code=409, detail=f"Job is {job['state']}; required tasks are not complete")
-        rows = connection.execute(
-            "SELECT task_key, result_json FROM tasks WHERE job_id = ? AND state = 'succeeded' ORDER BY task_key",
-            (job_id,),
-        ).fetchall()
-    results = [{"task_key": row["task_key"], "result": json.loads(row["result_json"])} for row in rows]
+    with connection_scope() as db:
+        job_doc = require_master_job(db, job_id, user)
+        if job_doc["state"] != "completed":
+            raise HTTPException(status_code=409, detail=f"Job is {job_doc['state']}; required tasks are not complete")
+        docs = list(db.tasks.find({"job_id": job_id, "state": "succeeded"}).sort("task_key", 1))
+    results = [{"task_key": d["task_key"], "result": json.loads(d["result_json"])} for d in docs]
     return FinalResultResponse(job_id=job_id, aggregation="collect", task_count=len(results), result_hash=json_hash(results), results=results)
 
 
 @app.get("/api/v1/jobs/{job_id}/report")
 def get_job_report(job_id: str, user: CurrentUser, format: str | None = None) -> Any:
-    with connection_scope() as connection:
-        job = require_master_job(connection, job_id, user)
-        tasks_rows = connection.execute(
-            """
-            SELECT tasks.*, nodes.node_name FROM tasks
-            LEFT JOIN nodes ON nodes.id = tasks.assigned_node_id
-            WHERE tasks.job_id = ? ORDER BY tasks.task_key
-            """,
-            (job_id,),
-        ).fetchall()
+    with connection_scope() as db:
+        job_doc = require_master_job(db, job_id, user)
+        tasks_docs = list(db.tasks.find({"job_id": job_id}).sort("task_key", 1))
+
+        # Build node name lookup
+        node_name_map: dict[str, str] = {}
+        for td in tasks_docs:
+            nid = td.get("assigned_node_id")
+            if nid and nid not in node_name_map:
+                nd = db.nodes.find_one({"node_id": nid}, {"node_name": 1})
+                node_name_map[nid] = nd["node_name"] if nd else "Unknown"
 
         node_stats: dict[str, dict[str, Any]] = {}
         report_tasks: list[TaskReportItem] = []
-        for row in tasks_rows:
-            node_id = row["assigned_node_id"] or "unassigned"
-            node_name = row["node_name"] or "Unassigned"
-            if node_id not in node_stats and node_id != "unassigned":
-                node_stats[node_id] = {
-                    "node_id": node_id,
-                    "node_name": node_name,
-                    "tasks_completed": 0,
-                    "tasks_failed": 0,
-                    "total_compute_seconds": 0.0,
-                }
-            if row["state"] == "succeeded" and node_id in node_stats:
-                node_stats[node_id]["tasks_completed"] += 1
-                if row["duration_seconds"]:
-                    node_stats[node_id]["total_compute_seconds"] += float(row["duration_seconds"])
-            elif row["state"] == "failed" and node_id in node_stats:
-                node_stats[node_id]["tasks_failed"] += 1
-
-            report_tasks.append(
-                TaskReportItem(
-                    task_key=row["task_key"],
-                    state=row["state"],
-                    attempt=row["attempt"],
-                    assigned_node_id=row["assigned_node_id"],
-                    node_name=row["node_name"],
-                    started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
-                    completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
-                    duration_seconds=row["duration_seconds"],
-                    error=row["error"],
-                )
-            )
+        for td in tasks_docs:
+            nid = td.get("assigned_node_id") or "unassigned"
+            nn = node_name_map.get(nid, "Unassigned")
+            if nid != "unassigned" and nid not in node_stats:
+                node_stats[nid] = {"node_id": nid, "node_name": nn, "tasks_completed": 0, "tasks_failed": 0, "total_compute_seconds": 0.0}
+            if td["state"] == "succeeded" and nid in node_stats:
+                node_stats[nid]["tasks_completed"] += 1
+                if td.get("duration_seconds"):
+                    node_stats[nid]["total_compute_seconds"] += float(td["duration_seconds"])
+            elif td["state"] == "failed" and nid in node_stats:
+                node_stats[nid]["tasks_failed"] += 1
+            report_tasks.append(TaskReportItem(
+                task_key=td["task_key"],
+                state=td["state"],
+                attempt=td.get("attempt", 0),
+                assigned_node_id=td.get("assigned_node_id"),
+                node_name=node_name_map.get(td.get("assigned_node_id", ""), None),
+                started_at=_parse_dt(td.get("started_at")),
+                completed_at=_parse_dt(td.get("completed_at")),
+                duration_seconds=td.get("duration_seconds"),
+                error=td.get("error"),
+            ))
 
         nodes_summary = []
-        for n_id, data in node_stats.items():
+        for nid, data in node_stats.items():
             completed = data["tasks_completed"]
             tot_sec = round(data["total_compute_seconds"], 3)
             avg_sec = round(tot_sec / completed, 3) if completed > 0 else 0.0
-            nodes_summary.append(
-                NodePerformanceSummary(
-                    node_id=n_id,
-                    node_name=data["node_name"],
-                    tasks_completed=completed,
-                    tasks_failed=data["tasks_failed"],
-                    total_compute_seconds=tot_sec,
-                    avg_task_duration_seconds=avg_sec,
-                )
-            )
+            nodes_summary.append(NodePerformanceSummary(
+                node_id=nid, node_name=data["node_name"],
+                tasks_completed=completed, tasks_failed=data["tasks_failed"],
+                total_compute_seconds=tot_sec, avg_task_duration_seconds=avg_sec,
+            ))
 
         task_count = len(report_tasks)
         succeeded_count = sum(1 for t in report_tasks if t.state == "succeeded")
         failed_count = sum(1 for t in report_tasks if t.state == "failed")
-
-        created = datetime.fromisoformat(job["created_at"])
-        updated = datetime.fromisoformat(job["updated_at"])
-        total_duration = (updated - created).total_seconds() if job["state"] in ("completed", "failed", "canceled") else None
-
-        row_keys = job.keys() if hasattr(job, "keys") else []
-        scheduling_policy = job["scheduling_policy"] if "scheduling_policy" in row_keys else "automatic"
+        created = _parse_dt(job_doc["created_at"])
+        updated = _parse_dt(job_doc["updated_at"])
+        total_duration = (updated - created).total_seconds() if job_doc["state"] in ("completed", "failed", "canceled") else None
 
         report = JobReportResponse(
-            job_id=job["id"],
-            job_name=job["name"],
-            cluster_id=job["cluster_id"],
-            state=job["state"],
-            execution_mode=job["execution_mode"],
-            scheduling_policy=scheduling_policy,
-            priority=job["priority"],
-            task_count=task_count,
-            succeeded_count=succeeded_count,
-            failed_count=failed_count,
+            job_id=job_doc["job_id"], job_name=job_doc["name"], cluster_id=job_doc["cluster_id"],
+            state=job_doc["state"], execution_mode=job_doc["execution_mode"],
+            scheduling_policy=job_doc.get("scheduling_policy", "automatic"),
+            priority=job_doc.get("priority", 0),
+            task_count=task_count, succeeded_count=succeeded_count, failed_count=failed_count,
             total_duration_seconds=round(total_duration, 2) if total_duration else None,
-            created_at=created,
-            updated_at=updated,
-            nodes=nodes_summary,
-            tasks=report_tasks,
+            created_at=created, updated_at=updated,
+            nodes=nodes_summary, tasks=report_tasks,
         )
 
         if format == "markdown":
@@ -1134,108 +1213,48 @@ def get_job_report(job_id: str, user: CurrentUser, format: str | None = None) ->
 
 @app.get("/api/v1/clusters/{cluster_id}/summary", response_model=ClusterSummaryResponse)
 def get_cluster_summary(cluster_id: str, user: CurrentUser) -> ClusterSummaryResponse:
-    with connection_scope() as connection:
-        cluster = require_master_cluster(connection, cluster_id, user)
-        connection.execute(
-            """
-            UPDATE nodes SET status = 'offline', updated_at = ?
-            WHERE status = 'online' AND last_heartbeat_at < ?
-              AND id IN (SELECT node_id FROM cluster_members WHERE cluster_id = ?)
-            """,
-            (timestamp(utc_now()), timestamp(utc_now() - timedelta(seconds=HEARTBEAT_STALE_SECONDS)), cluster_id),
-        )
-        nodes = connection.execute(
-            """
-            SELECT nodes.* FROM nodes
-            JOIN cluster_members ON cluster_members.node_id = nodes.id
-            WHERE cluster_members.cluster_id = ?
-            """,
-            (cluster_id,),
-        ).fetchall()
-        jobs = connection.execute(
-            "SELECT state FROM jobs WHERE cluster_id = ?",
-            (cluster_id,),
-        ).fetchall()
-
-        reg_count = len(nodes)
-        online_count = sum(1 for n in nodes if n["status"] == "online")
-        offline_count = sum(1 for n in nodes if n["status"] == "offline")
-        detected_gpus = sum(1 for n in nodes if n["gpu_model"])
-        total_vram = sum((n["gpu_vram_bytes"] or 0) for n in nodes)
-
-        active_jobs = sum(1 for j in jobs if j["state"] in ("running", "paused"))
-        queued_jobs = sum(1 for j in jobs if j["state"] == "queued")
-        completed_jobs = sum(1 for j in jobs if j["state"] == "completed")
-        failed_jobs = sum(1 for j in jobs if j["state"] == "failed")
+    with connection_scope() as db:
+        cluster_doc = require_master_cluster(db, cluster_id, user)
+        now = utc_now()
+        _mark_stale_nodes_offline(db, cluster_id, now)
+        member_ids = [m["node_id"] for m in db.cluster_members.find({"cluster_id": cluster_id})]
+        nodes = list(db.nodes.find({"node_id": {"$in": member_ids}}))
+        jobs = list(db.jobs.find({"cluster_id": cluster_id}, {"state": 1}))
 
         return ClusterSummaryResponse(
             cluster_id=cluster_id,
-            cluster_name=cluster["name"],
-            registered_nodes=reg_count,
-            online_nodes=online_count,
-            offline_nodes=offline_count,
-            detected_gpus=detected_gpus,
-            total_vram_bytes=total_vram,
-            active_jobs=active_jobs,
-            queued_jobs=queued_jobs,
-            completed_jobs=completed_jobs,
-            failed_jobs=failed_jobs,
+            cluster_name=cluster_doc["name"],
+            registered_nodes=len(nodes),
+            online_nodes=sum(1 for n in nodes if n["status"] == "online"),
+            offline_nodes=sum(1 for n in nodes if n["status"] == "offline"),
+            detected_gpus=sum(1 for n in nodes if n.get("gpu_model")),
+            total_vram_bytes=sum((n.get("gpu_vram_bytes") or 0) for n in nodes),
+            active_jobs=sum(1 for j in jobs if j["state"] in ("running", "paused")),
+            queued_jobs=sum(1 for j in jobs if j["state"] == "queued"),
+            completed_jobs=sum(1 for j in jobs if j["state"] == "completed"),
+            failed_jobs=sum(1 for j in jobs if j["state"] == "failed"),
         )
 
 
-@app.get("/api/v1/worker/my-nodes", response_model=list[NodeResponse])
-def list_my_worker_nodes(user: CurrentUser) -> list[NodeResponse]:
-    with connection_scope() as connection:
-        rows = connection.execute(
-            """
-            SELECT nodes.*, COALESCE(cluster_members.status, 'unpaired') AS membership_status
-            FROM nodes
-            LEFT JOIN cluster_members ON cluster_members.node_id = nodes.id
-            WHERE nodes.owner_id = ?
-            ORDER BY nodes.created_at DESC
-            """,
-            (user.id,),
-        ).fetchall()
-    return [node_response(row) for row in rows]
-
-
-@app.post("/api/v1/worker/nodes/{node_id}/drain", response_model=NodeResponse)
-def drain_worker_node(node_id: str, user: CurrentUser) -> NodeResponse:
-    now = utc_now()
-    with connection_scope() as connection:
-        require_worker_node(connection, node_id, user)
-        connection.execute(
-            "UPDATE nodes SET status = 'draining', updated_at = ? WHERE id = ?",
-            (timestamp(now), node_id),
-        )
-        row = connection.execute(
-            """
-            SELECT nodes.*, COALESCE(cluster_members.status, 'unpaired') AS membership_status
-            FROM nodes
-            LEFT JOIN cluster_members ON cluster_members.node_id = nodes.id
-            WHERE nodes.id = ?
-            """,
-            (node_id,),
-        ).fetchone()
-        record_audit(connection, user.id, "node.drain", "node", node_id, "success")
-    return node_response(row)
-
+# ---------------------------------------------------------------------------
+# Job state transitions
+# ---------------------------------------------------------------------------
 
 def update_job_state(job_id: str, user: UserResponse, expected_states: tuple[str, ...], next_state: str) -> JobResponse:
     now = utc_now()
-    with connection_scope() as connection:
-        job = require_master_job(connection, job_id, user)
-        if job["state"] not in expected_states:
-            raise HTTPException(status_code=409, detail=f"Job is {job['state']} and cannot become {next_state}")
-        connection.execute("UPDATE jobs SET state = ?, updated_at = ? WHERE id = ?", (next_state, timestamp(now), job_id))
+    with connection_scope() as db:
+        job_doc = require_master_job(db, job_id, user)
+        if job_doc["state"] not in expected_states:
+            raise HTTPException(status_code=409, detail=f"Job is {job_doc['state']} and cannot become {next_state}")
+        db.jobs.update_one({"job_id": job_id}, {"$set": {"state": next_state, "updated_at": now}})
         if next_state == "canceled":
-            connection.execute(
-                "UPDATE tasks SET state = 'canceled', lease_token_hash = NULL, lease_expires_at = NULL, updated_at = ? WHERE job_id = ? AND state NOT IN ('succeeded', 'failed', 'canceled')",
-                (timestamp(now), job_id),
+            db.tasks.update_many(
+                {"job_id": job_id, "state": {"$nin": ["succeeded", "failed", "canceled"]}},
+                {"$set": {"state": "canceled", "lease_token_hash": None, "lease_expires_at": None, "updated_at": now}},
             )
-        record_audit(connection, user.id, f"job.{next_state}", "job", job_id, "success")
-        updated = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        return job_response(connection, updated)
+        record_audit(db, user.id, f"job.{next_state}", "job", job_id, "success")
+        updated = db.jobs.find_one({"job_id": job_id})
+        return job_response(db, updated)
 
 
 @app.post("/api/v1/jobs/{job_id}/pause", response_model=JobResponse)
@@ -1253,95 +1272,113 @@ def cancel_job(job_id: str, user: CurrentUser) -> JobResponse:
     return update_job_state(job_id, user, ("queued", "running", "paused"), "canceled")
 
 
-def recover_expired_leases(connection, now: datetime) -> None:
-    expired = connection.execute(
-        """
-        SELECT tasks.*, jobs.retry_limit FROM tasks JOIN jobs ON jobs.id = tasks.job_id
-        WHERE tasks.state IN ('leased', 'running') AND tasks.lease_expires_at <= ?
-        """,
-        (timestamp(now),),
-    ).fetchall()
-    for row in expired:
-        next_state = "queued" if row["attempt"] < row["retry_limit"] + 1 else "failed"
-        retry_at = now + timedelta(seconds=retry_delay_seconds(row["attempt"])) if next_state == "queued" else None
-        connection.execute(
-            """
-            UPDATE tasks SET state = ?, assigned_node_id = NULL, lease_token_hash = NULL,
-                lease_expires_at = NULL, next_retry_at = ?, error = ?, updated_at = ? WHERE id = ?
-            """,
-            (next_state, timestamp(retry_at) if retry_at else None, "Lease expired" if next_state == "failed" else None, timestamp(now), row["id"]),
-        )
-        connection.execute(
-            "UPDATE task_attempts SET state = 'timed_out', completed_at = ?, error = ? WHERE task_id = ? AND attempt = ? AND completed_at IS NULL",
-            (timestamp(now), "Lease expired", row["id"], row["attempt"]),
-        )
-        reconcile_job(connection, row["job_id"], now)
-
+# ---------------------------------------------------------------------------
+# Task Lease & Result
+# ---------------------------------------------------------------------------
 
 def retry_delay_seconds(attempt: int) -> int:
     return min(60, 2 ** max(0, attempt - 1))
 
 
-def task_is_compatible_with_node(task_payload: dict[str, Any], node) -> bool:
+def task_is_compatible_with_node(task_payload: dict[str, Any], node_doc: dict) -> bool:
     backend = task_payload.get("backend", "cpu")
-    if backend == "opencl" and (node["compute_backend"] or "").lower() != "opencl":
+    if backend == "opencl" and (node_doc.get("compute_backend") or "").lower() != "opencl":
         return False
     required_threads = task_payload.get("required_cpu_threads", 0)
-    if isinstance(required_threads, (int, float)) and node["cpu_threads"] is not None and required_threads > node["cpu_threads"]:
+    if isinstance(required_threads, (int, float)) and node_doc.get("cpu_threads") is not None and required_threads > node_doc["cpu_threads"]:
         return False
     required_vram = task_payload.get("required_gpu_memory_bytes", 0)
     if backend == "opencl":
-        available_vram = (node["gpu_vram_bytes"] or 0) - (node["gpu_used_vram_bytes"] or 0)
+        available_vram = (node_doc.get("gpu_vram_bytes") or 0) - (node_doc.get("gpu_used_vram_bytes") or 0)
         if not isinstance(required_vram, (int, float)) or required_vram > available_vram:
             return False
     return True
 
 
+def recover_expired_leases(db, now: datetime) -> None:
+    expired = list(db.tasks.aggregate([
+        {"$match": {"state": {"$in": ["leased", "running"]}, "lease_expires_at": {"$lte": now}}},
+        {"$lookup": {"from": "jobs", "localField": "job_id", "foreignField": "job_id", "as": "job"}},
+        {"$unwind": "$job"},
+        {"$addFields": {"retry_limit": "$job.retry_limit"}},
+    ]))
+    for row in expired:
+        next_state = "queued" if row.get("attempt", 0) < row["retry_limit"] + 1 else "failed"
+        retry_at = now + timedelta(seconds=retry_delay_seconds(row.get("attempt", 0))) if next_state == "queued" else None
+        db.tasks.update_one(
+            {"task_id": row["task_id"]},
+            {"$set": {
+                "state": next_state,
+                "assigned_node_id": None,
+                "lease_token_hash": None,
+                "lease_expires_at": None,
+                "next_retry_at": retry_at,
+                "error": "Lease expired" if next_state == "failed" else None,
+                "updated_at": now,
+            }},
+        )
+        reconcile_job(db, row["job_id"], now)
+
+
 @app.post("/api/v1/worker/nodes/{node_id}/tasks/lease", response_model=TaskLeaseResponse | None)
 def lease_task(node_id: str, user: CurrentUser) -> TaskLeaseResponse | None:
     now = utc_now()
-    with connection_scope() as connection:
-        node = require_worker_node(connection, node_id, user)
-        membership = connection.execute(
-            "SELECT cluster_id, status FROM cluster_members WHERE node_id = ?", (node_id,)
-        ).fetchone()
+    with connection_scope() as db:
+        node_doc = require_worker_node(db, node_id, user)
+        membership = db.cluster_members.find_one({"node_id": node_id})
         if membership is None or membership["status"] != "approved":
             raise HTTPException(status_code=403, detail="Node is not approved for a cluster")
-        if not node_has_fresh_heartbeat(node, now):
+        if not node_has_fresh_heartbeat(node_doc, now):
             raise HTTPException(status_code=409, detail="Node heartbeat is stale or offline")
-        recover_expired_leases(connection, now)
-        candidates = connection.execute(
-            """
-            SELECT tasks.*, jobs.lease_seconds FROM tasks
-            JOIN jobs ON jobs.id = tasks.job_id
-            WHERE jobs.cluster_id = ? AND jobs.state IN ('queued', 'running')
-              AND tasks.state = 'queued' AND (tasks.next_retry_at IS NULL OR tasks.next_retry_at <= ?)
-              AND (tasks.pinned_node_id IS NULL OR tasks.pinned_node_id = ?)
-            ORDER BY jobs.priority DESC, jobs.created_at, tasks.created_at LIMIT 100
-            """,
-            (membership["cluster_id"], timestamp(now), node_id),
-        ).fetchall()
-        row = next((candidate for candidate in candidates if task_is_compatible_with_node(json.loads(candidate["payload_json"]), node)), None)
-        if row is None:
+        recover_expired_leases(db, now)
+        cluster_id = membership["cluster_id"]
+
+        # Find candidate tasks
+        candidates = list(db.tasks.aggregate([
+            {"$match": {
+                "state": "queued",
+                "$or": [{"next_retry_at": None}, {"next_retry_at": {"$lte": now}}],
+                "$or": [{"pinned_node_id": None}, {"pinned_node_id": node_id}],
+            }},
+            {"$lookup": {"from": "jobs", "localField": "job_id", "foreignField": "job_id", "as": "job"}},
+            {"$unwind": "$job"},
+            {"$match": {"job.cluster_id": cluster_id, "job.state": {"$in": ["queued", "running"]}}},
+            {"$sort": {"job.priority": -1, "job.created_at": 1, "created_at": 1}},
+            {"$limit": 100},
+        ]))
+
+        selected = None
+        for candidate in candidates:
+            payload_data = json.loads(candidate["payload_json"])
+            if task_is_compatible_with_node(payload_data, node_doc):
+                selected = candidate
+                break
+
+        if selected is None:
             return None
+
         lease_token = secrets.token_urlsafe(32)
-        lease_expires_at = now + timedelta(seconds=row["lease_seconds"])
-        attempt = row["attempt"] + 1
-        started_at = row["started_at"] or timestamp(now)
-        connection.execute(
-            """
-            UPDATE tasks SET state = 'leased', attempt = ?, assigned_node_id = ?,
-                lease_token_hash = ?, lease_expires_at = ?, next_retry_at = NULL, started_at = ?, updated_at = ? WHERE id = ?
-            """,
-            (attempt, node_id, hash_token(lease_token), timestamp(lease_expires_at), started_at, timestamp(now), row["id"]),
+        lease_seconds = selected["job"].get("lease_seconds", 60)
+        lease_expires_at = now + timedelta(seconds=lease_seconds)
+        attempt = selected.get("attempt", 0) + 1
+        started_at = selected.get("started_at") or now
+
+        db.tasks.update_one(
+            {"task_id": selected["task_id"]},
+            {"$set": {
+                "state": "leased",
+                "attempt": attempt,
+                "assigned_node_id": node_id,
+                "lease_token_hash": hash_token(lease_token),
+                "lease_expires_at": lease_expires_at,
+                "next_retry_at": None,
+                "started_at": started_at,
+                "updated_at": now,
+            }},
         )
-        connection.execute(
-            "INSERT INTO task_attempts(id, task_id, attempt, node_id, state, leased_at) VALUES (?, ?, ?, ?, 'leased', ?)",
-            (str(uuid.uuid4()), row["id"], attempt, node_id, timestamp(now)),
-        )
-        connection.execute("UPDATE jobs SET state = 'running', updated_at = ? WHERE id = ?", (timestamp(now), row["job_id"]))
-        leased = connection.execute("SELECT * FROM tasks WHERE id = ?", (row["id"],)).fetchone()
-    return TaskLeaseResponse(lease_token=lease_token, task=task_response(leased))
+        db.jobs.update_one({"job_id": selected["job_id"]}, {"$set": {"state": "running", "updated_at": now}})
+        leased_doc = db.tasks.find_one({"task_id": selected["task_id"]})
+    return TaskLeaseResponse(lease_token=lease_token, task=task_response(leased_doc))
 
 
 @app.post("/api/v1/worker/tasks/{task_id}/result", response_model=TaskResponse)
@@ -1349,70 +1386,70 @@ def submit_task_result(task_id: str, payload: TaskResultRequest, user: CurrentUs
     now = utc_now()
     if payload.status == "failed" and not payload.error:
         raise HTTPException(status_code=400, detail="error is required for a failed task")
-    with connection_scope() as connection:
-        task = connection.execute(
-            """
-            SELECT tasks.*, jobs.retry_limit FROM tasks JOIN jobs ON jobs.id = tasks.job_id
-            WHERE tasks.id = ?
-            """,
-            (task_id,),
-        ).fetchone()
-        if task is None:
+    with connection_scope() as db:
+        task_docs = list(db.tasks.aggregate([
+            {"$match": {"task_id": task_id}},
+            {"$lookup": {"from": "jobs", "localField": "job_id", "foreignField": "job_id", "as": "job"}},
+            {"$unwind": "$job"},
+            {"$addFields": {"retry_limit": "$job.retry_limit"}},
+        ]))
+        if not task_docs:
             raise HTTPException(status_code=404, detail="Task not found")
-        node = require_worker_node(connection, task["assigned_node_id"], user)
-        if task["state"] == "succeeded":
-            return task_response(task)
-        if task["state"] not in ("leased", "running") or task["lease_expires_at"] <= timestamp(now):
+        task_doc = task_docs[0]
+        require_worker_node(db, task_doc.get("assigned_node_id", ""), user)
+        if task_doc["state"] == "succeeded":
+            return task_response(task_doc)
+        lease_exp = task_doc.get("lease_expires_at")
+        if task_doc["state"] not in ("leased", "running") or (lease_exp and _parse_dt(lease_exp) <= now):
             raise HTTPException(status_code=409, detail="Task lease is no longer active")
-        if not hmac.compare_digest(task["lease_token_hash"], hash_token(payload.lease_token)):
+        stored_hash = task_doc.get("lease_token_hash", "")
+        if not hmac.compare_digest(stored_hash, hash_token(payload.lease_token)):
             raise HTTPException(status_code=409, detail="Invalid task lease token")
+
         result_json = canonical_json(payload.result) if payload.result is not None else None
         result_hash = json_hash(payload.result) if payload.result is not None else None
+
         if payload.status == "succeeded":
             next_state = "succeeded"
             next_error = None
         else:
-            next_state = "queued" if task["attempt"] < task["retry_limit"] + 1 else "failed"
+            next_state = "queued" if task_doc.get("attempt", 0) < task_doc["retry_limit"] + 1 else "failed"
             next_error = payload.error
-        retry_at = now + timedelta(seconds=retry_delay_seconds(task["attempt"])) if next_state == "queued" else None
-        
-        started_at = task["started_at"]
+
+        retry_at = now + timedelta(seconds=retry_delay_seconds(task_doc.get("attempt", 0))) if next_state == "queued" else None
+        started_at = task_doc.get("started_at")
         duration_seconds = None
         if started_at:
             try:
-                duration_seconds = round(max(0.0, (now - datetime.fromisoformat(started_at)).total_seconds()), 3)
+                duration_seconds = round(max(0.0, (now - _parse_dt(started_at)).total_seconds()), 3)
             except Exception:
                 pass
-        completed_at = timestamp(now) if payload.status == "succeeded" else None
+        completed_at = now if payload.status == "succeeded" else None
 
-        connection.execute(
-            """
-            UPDATE tasks SET state = ?, assigned_node_id = ?, lease_token_hash = NULL,
-                lease_expires_at = NULL, next_retry_at = ?, result_json = ?, result_hash = ?, error = ?,
-                completed_at = ?, duration_seconds = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                next_state,
-                task["assigned_node_id"] if next_state == "succeeded" else None,
-                timestamp(retry_at) if retry_at else None,
-                result_json,
-                result_hash,
-                next_error,
-                completed_at,
-                duration_seconds,
-                timestamp(now),
-                task_id,
-            ),
+        db.tasks.update_one(
+            {"task_id": task_id},
+            {"$set": {
+                "state": next_state,
+                "assigned_node_id": task_doc.get("assigned_node_id") if next_state == "succeeded" else None,
+                "lease_token_hash": None,
+                "lease_expires_at": None,
+                "next_retry_at": retry_at,
+                "result_json": result_json,
+                "result_hash": result_hash,
+                "error": next_error,
+                "completed_at": completed_at,
+                "duration_seconds": duration_seconds,
+                "updated_at": now,
+            }},
         )
-        connection.execute(
-            "UPDATE task_attempts SET state = ?, completed_at = ?, error = ? WHERE task_id = ? AND attempt = ?",
-            (payload.status, timestamp(now), payload.error, task_id, task["attempt"]),
-        )
-        reconcile_job(connection, task["job_id"], now)
-        updated = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        reconcile_job(db, task_doc["job_id"], now)
+        updated = db.tasks.find_one({"task_id": task_id})
     return task_response(updated)
 
+
+# ---------------------------------------------------------------------------
+# Workloads
+# ---------------------------------------------------------------------------
 
 @app.post("/api/v1/workloads", response_model=WorkloadResponse, status_code=status.HTTP_201_CREATED)
 async def upload_workload(
@@ -1438,25 +1475,51 @@ async def upload_workload(
     storage_directory.mkdir(parents=True, exist_ok=True)
     storage_path = storage_directory / f"{workload_id}.zip"
     storage_path.write_bytes(data)
-    with connection_scope() as connection:
-        connection.execute(
-            """
-            INSERT INTO workload_packages(
-                id, owner_id, name, manifest_json, content_hash, size_bytes,
-                validation_state, storage_path, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'validated', ?, ?)
-            """,
-            (workload_id, user.id, parsed_manifest.name, parsed_manifest.model_dump_json(), content_hash, len(data), str(storage_path), timestamp(now)),
-        )
-        record_audit(connection, user.id, "workload.validated", "workload", workload_id, "success", {"content_hash": content_hash, "size_bytes": len(data)})
-        row = connection.execute("SELECT * FROM workload_packages WHERE id = ?", (workload_id,)).fetchone()
-    return workload_response(row)
+
+    with connection_scope() as db:
+        db.workloads.insert_one({
+            "workload_id": workload_id,
+            "owner_id": user.id,
+            "name": parsed_manifest.name,
+            "manifest_json": parsed_manifest.model_dump_json(),
+            "content_hash": content_hash,
+            "size_bytes": len(data),
+            "validation_state": "validated",
+            "storage_path": str(storage_path),
+            "created_at": now,
+        })
+        record_audit(db, user.id, "workload.validated", "workload", workload_id, "success", {"content_hash": content_hash, "size_bytes": len(data)})
+        doc = db.workloads.find_one({"workload_id": workload_id})
+    return workload_response(doc)
 
 
 @app.get("/api/v1/workloads", response_model=list[WorkloadResponse])
 def list_workloads(user: CurrentUser) -> list[WorkloadResponse]:
-    with connection_scope() as connection:
-        rows = connection.execute(
-            "SELECT * FROM workload_packages WHERE owner_id = ? ORDER BY created_at DESC", (user.id,)
-        ).fetchall()
-    return [workload_response(row) for row in rows]
+    with connection_scope() as db:
+        docs = list(db.workloads.find({"owner_id": user.id}).sort("created_at", -1))
+    return [workload_response(d) for d in docs]
+
+
+# ---------------------------------------------------------------------------
+# Frontend SPA Static Serving (Unified Server)
+# ---------------------------------------------------------------------------
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+frontend_dist_path = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+assets_path = frontend_dist_path / "assets"
+
+if assets_path.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(assets_path)), name="frontend_assets")
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_frontend_spa(full_path: str):
+    if full_path and not full_path.startswith("api/"):
+        candidate = frontend_dist_path / full_path
+        if candidate.is_file():
+            return FileResponse(candidate)
+    index_file = frontend_dist_path / "index.html"
+    if index_file.is_file():
+        return FileResponse(index_file)
+    return {"message": "NEXORA Master API running. Frontend build not found."}

@@ -1,110 +1,107 @@
-# NEXORA
+# NEXORA — Distributed GPU Computing Platform
 
-NEXORA is a Windows-first, LAN-based distributed GPU computing platform.
+NEXORA is a high-performance, distributed GPU computing platform designed for Windows LAN networks and cloud deployment. It enables a Master node to orchestrate and distribute parallel computational workloads across multiple GPU/CPU worker machines with zero friction.
 
-## Current Scope
+---
 
-The first release is an explicit task-parallel MVP:
+## ⚡ Architecture Highlights
 
-- One Master console with dynamically paired Worker Agents.
-- Outbound Worker connections over a configured LAN endpoint.
-- SQLite persistence for local development (PostgreSQL migration ready).
-- Versioned workload manifests with an explicit task generator and result contract.
-- Automatic (dynamic resource-aware), Manual (% or count allocation), and Hybrid scheduling policies.
-- Visual Cluster Topology diagram in Master console showing connection status and active tasks.
-- Downloadable execution reports in both Markdown and JSON with per-node compute metrics.
-- Worker Operator Console with dedicated node overview and safe drainage.
-- Task execution duration metrics (`duration_seconds`, `started_at`, `completed_at`).
-- Actual per-machine hardware and OpenCL capability qualification.
-- CPU fallback reported separately from GPU execution.
+1. **MongoDB Atlas Cloud Database**:
+   - Replaced SQLite with MongoDB Atlas persistence.
+   - Built-in TTL indexes for automated 7-day telemetry log cleanup (preventing storage bloat).
+   - Dynamic per-test database isolation.
 
-The platform does not merge GPU VRAM, automatically partition arbitrary code, or claim data/model parallelism before a workload adapter exists. Historical addresses in the PRD are treated as unverified and are never hard-coded.
+2. **Unified Frontend & Backend Server**:
+   - Single FastAPI process serving both the REST API and the React SPA dashboard on port `5000`.
+   - Eliminates the need to run separate Node.js development servers in production.
 
-## Phase 1
+3. **1-Click Standalone Desktop Worker GUI (`NEXORA-Worker.exe`)**:
+   - Built-in Windows executable (`dist/NEXORA-Worker.exe`) for friends/workers.
+   - Requires **no Python, Git, or terminal commands** on worker machines.
+   - Auto-detects local hardware (CPU cores, RAM, and GPU model/VRAM).
+   - Real-time telemetry reporting (CPU/RAM/GPU utilization).
 
-Run the local audit from PowerShell:
+4. **Dynamic Scheduling Policies**:
+   - **Automatic**: Dynamic resource-aware allocation to the most qualified available nodes.
+   - **Manual**: Explicit node pinning or percentage/count quotas across nodes.
+   - **Hybrid**: Mix of manual pinning and automatic dynamic scheduling.
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\phase1-audit.ps1 -MasterHost 127.0.0.1 -MasterPort 5000
-```
+5. **Cloud Deployment Ready**:
+   - Multi-stage `Dockerfile` (Node 20 builder + Python 3.12 runner).
+   - `render.yaml` for 1-click Render / Railway deployment.
 
-The script writes a timestamped JSON report to `artifacts/phase1/` and reports network interfaces, private IPv4 addresses, routes, CPU/RAM, GPU candidates, Python availability, and TCP reachability. GPU metrics are marked unavailable unless Windows exposes them through a supported query source; an OpenCL known-answer test will be added to the Worker Agent phase.
+---
 
-## Backend Development
+## 🚀 Quick Start (Localhost)
 
-Install and run the current Master API from the repository root:
+### 1. Start Master Server (Dashboard + Backend API)
 
-```powershell
-python -m pip install -r backend\requirements.txt
-python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 5000
-```
-
-Run the backend tests:
+Double-click `start_backend.bat` or run:
 
 ```powershell
-python -m pytest backend\tests -q
+python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 5000 --reload
 ```
 
-The current API implements health checks, registration, login, logout, session validation, Master-owned clusters, single-use Worker pairing, explicit approval, node inventory, authenticated heartbeat telemetry, explicit task-parallel jobs, Worker leases, retry recovery, idempotent result acceptance, validated ZIP workload package storage, and manifest-linked jobs. The Worker Agent runs only built-in adapters in a timed child process. Dependency installation and full sandboxed uploaded-code execution are next.
+Open your browser at: **[http://localhost:5000](http://localhost:5000)**
 
-## Worker Agent
+### 2. Connect a Worker Node
 
-The Worker Agent currently uses the paired Worker session token and supports the deterministic task contract. Run one cycle for a smoke test:
+#### Option A: 1-Click Desktop GUI (Recommended)
+1. Run `dist\NEXORA-Worker.exe` (or `scripts\start-worker-gui.bat`).
+2. Verify detected hardware specs.
+3. Enter Master URL (`http://localhost:5000` or your LAN IP `http://192.168.x.x:5000`).
+4. Click **`[ 🚀 Connect GPU / CPU to Cluster ]`**.
+5. Approve the worker request from the Master Dashboard under the **Overview / Nodes** section.
+
+#### Option B: Terminal CLI Worker
+```powershell
+.\scripts\start-worker.bat
+```
+
+---
+
+## 🧪 Running Tests
+
+To run the complete test suite:
 
 ```powershell
-python -m pip install -r worker_agent\requirements.txt
-$env:NEXORA_MASTER_URL = "http://127.0.0.1:5000"
-$env:NEXORA_NODE_ID = "<approved-node-id>"
-$env:NEXORA_ACCESS_TOKEN = "<worker-session-token>"
-python -m worker_agent.agent.main --pairing-code "<pairing-code>"
+.\run_tests.bat
+# Or manually:
+python -m pytest backend/tests worker_agent/tests -v
 ```
 
-The command submits the local hardware inventory as a pending node request and exits. Approve the node from the Master API/dashboard, then run continuously with the printed node ID. The execution timeout defaults to 30 seconds:
+All 22 core integration tests verify:
+- Authentication & Sessions
+- Cluster Creation & Pairing
+- Automated & Manual Scheduling
+- Worker Leasing & Heartbeat Health
+- Deterministic Task Parallel Workload Execution
 
-```powershell
-python -m worker_agent.agent.main --node-id "<approved-node-id>" --interval 2 --execution-timeout 30
+---
+
+## 📁 Repository Structure
+
 ```
-
-The agent does not execute uploaded source code. It rejects operations outside the explicit executor contract. Each built-in task runs in a temporary directory with a scrubbed environment, bounded JSON input/output, a timeout, and process-group cleanup. Windows Job Object CPU/RAM quotas and arbitrary-code sandboxing are not enabled yet.
-
-Each heartbeat reports CPU and RAM utilization measured by `psutil`. GPU utilization and VRAM remain `null` until a verified GPU backend adapter provides those measurements.
-
-Collect hardware evidence on each intended Master or Worker:
-
-```powershell
-python -m worker_agent.agent.hardware
+NEXORA/
+├── backend/                  # FastAPI Master Application
+│   ├── app/
+│   │   ├── main.py           # Core REST API + SPA static server
+│   │   ├── mongo_db.py       # MongoDB Atlas connection & TTL indexes
+│   │   ├── network.py        # Preflight network diagnostics
+│   │   └── workloads.py      # Manifest & execution validators
+│   ├── requirements.txt      # Python dependencies
+│   └── tests/                # Master API test suite
+├── frontend/                 # React + TypeScript + Vite Dashboard
+│   ├── src/                  # Dashboard UI components & views
+│   └── dist/                 # Built production frontend assets
+├── nexora_worker_gui/        # Standalone Worker Desktop GUI (Tkinter)
+│   └── worker_app.py         # 1-Click Worker application source
+├── worker_agent/             # Headless Worker Engine & OpenCL Executor
+│   └── agent/                # Hardware discovery, metrics & safe execution
+├── dist/                     # Compiled executables (NEXORA-Worker.exe)
+├── scripts/                  # Automation scripts (.bat & .ps1)
+├── Dockerfile                # Multi-stage production container
+├── render.yaml               # Cloud deployment blueprint
+├── start_backend.bat         # 1-Click Master launcher
+└── run_tests.bat             # 1-Click test runner
 ```
-
-The command reports current private IPv4 addresses, CPU/RAM, GPU driver metadata, and OpenCL status. OpenCL is marked `passed` only after a known-answer kernel executes successfully; missing runtimes are reported as `unavailable`.
-
-Workload manifests may declare `backend: "cpu"` or `backend: "opencl"`. Task payloads must match the manifest. Requesting OpenCL on a node without a verified OpenCL runtime fails explicitly; the agent never silently falls back to CPU.
-
-## Design Documents
-
-## Dashboard
-
-Start the Master API and dashboard in separate PowerShell terminals:
-
-```powershell
-python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 5000
-Push-Location frontend
-npm install
-npm run dev -- --host 127.0.0.1
-Pop-Location
-```
-
-Open `http://127.0.0.1:5173`. The dashboard uses the real API for login, cluster creation, node listing, logout, and five-second telemetry refresh.
-
-Equivalent scripts are available under `scripts/`:
-
-```powershell
-.\scripts\start-master.ps1
-.\scripts\start-dashboard.ps1
-$env:NEXORA_ACCESS_TOKEN = "<worker-session-token>"
-.\scripts\start-worker.ps1 -PairingCode "<pairing-code>"
-```
-
-- [Architecture](docs/architecture.md)
-- [Phase 1 audit](docs/phase-1-audit.md)
-- [Data model and API](docs/data-model-and-api.md)

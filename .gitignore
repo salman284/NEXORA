@@ -1,7 +1,38 @@
-artifacts/
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
 .venv/
 backend/.venv/
 worker-agent/.venv/
+*.egg-info/
+
+# Tests & IDE
+.pytest_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
+
+# Node & Frontend
 frontend/node_modules/
-*.pyc
+.vite/
+*.tsbuildinfo
+
+# PyInstaller & Build artifacts
+build/
+*.spec
+
+# Storage & Databases
+backend/data/*.db
+backend/data/workloads/*.zip
+artifacts/
+
+# OS specific
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: nexora-master
+    runtime: docker
+    plan: free
+    region: oregon
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: NEXORA_DB_NAME
+        value: nexora
+      - key: SECRET_KEY
+        generateValue: true

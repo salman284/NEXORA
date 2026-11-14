@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Host = "127.0.0.1",
+    [string]$Host = "0.0.0.0",
     [ValidateRange(1, 65535)]
     [int]$Port = 5000
 )
