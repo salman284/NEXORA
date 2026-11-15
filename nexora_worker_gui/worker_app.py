@@ -29,10 +29,10 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 try:
-    from worker_agent.agent.executor import execute_task_isolated
+    from worker_agent.agent.executor import execute_task_with_backend as run_task
 except ImportError:
     # Standalone fallback if packaged outside repo
-    def execute_task_isolated(payload: dict[str, Any], timeout_seconds: float = 30.0) -> dict[str, Any]:
+    def run_task(payload: dict[str, Any]) -> dict[str, Any]:
         op = payload.get("operation")
         if op == "identity":
             return {"value": payload.get("value")}
@@ -43,9 +43,8 @@ except ImportError:
             vals = payload.get("values", [])
             return {"value": sum(vals)}
         elif op == "matmul":
-            a = payload.get("a", [])
-            b = payload.get("b", [])
-            # standard matrix multiplication
+            a = payload.get("matrix_a") or payload.get("a", [])
+            b = payload.get("matrix_b") or payload.get("b", [])
             rows_a = len(a)
             cols_a = len(a[0]) if rows_a > 0 else 0
             rows_b = len(b)
@@ -53,7 +52,7 @@ except ImportError:
             if cols_a != rows_b:
                 raise ValueError("Dimension mismatch")
             result = [[sum(a[i][k] * b[k][j] for k in range(cols_a)) for j in range(cols_b)] for i in range(rows_a)]
-            return {"result": result}
+            return {"matrix": result}
         else:
             raise ValueError(f"Unsupported operation: {op}")
 
@@ -321,12 +320,25 @@ class NexoraWorkerApp(tk.Tk):
 
         # 2. Pairing Request
         self.log(f"Submitting join request for node '{node_name}'...")
+        local_ip = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            try:
+                local_ip = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                pass
+
         gpu_bytes = int(self.hardware["gpu_vram_gb"] * 1024**3) if self.hardware["gpu_vram_gb"] > 0 else None
         pair_payload = {
             "code": pairing_code,
             "node_name": node_name,
             "hostname": self.hardware["hostname"],
             "operating_system": self.hardware["os"],
+            "private_ipv4": local_ip,
             "cpu_model": self.hardware["cpu_model"],
             "cpu_threads": self.hardware["cpu_threads"],
             "ram_total_bytes": int(self.hardware["ram_total_gb"] * 1024**3),
@@ -416,7 +428,7 @@ class NexoraWorkerApp(tk.Tk):
                     # Execute task
                     t0 = time.time()
                     try:
-                        res = execute_task_isolated(task["payload"], timeout_seconds=30.0)
+                        res = run_task(task["payload"])
                         dur = round(time.time() - t0, 3)
                         # Submit success
                         sub = session.post(

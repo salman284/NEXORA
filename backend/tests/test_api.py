@@ -591,3 +591,27 @@ def test_manual_and_hybrid_scheduling_and_job_reports(client: TestClient):
     dl_res = client.get("/api/v1/worker/download-agent")
     assert dl_res.status_code == 200
     assert "NEXORA-Worker.exe" in dl_res.headers.get("content-disposition", "")
+
+    # Delete job
+    del_res = client.delete(f"/api/v1/jobs/{job['id']}", headers=master_headers)
+    assert del_res.status_code == 200
+    assert del_res.json()["job_id"] == job["id"]
+
+    # Verify job is gone
+    check_res = client.get(f"/api/v1/jobs/{job['id']}/tasks", headers=master_headers)
+    assert check_res.status_code == 404
+
+    # Master hard-delete offline node from cluster
+    # node1 is now draining (not "online"), so master can remove it
+    del_node_res = client.delete(
+        f"/api/v1/clusters/{cluster['id']}/members/{node1['id']}",
+        headers=master_headers,
+    )
+    assert del_node_res.status_code == 200
+    assert del_node_res.json()["node_id"] == node1["id"]
+
+    # Confirm node1 is no longer in the cluster node list
+    nodes_after = client.get(f"/api/v1/clusters/{cluster['id']}/nodes", headers=master_headers).json()
+    node_ids_after = [n["id"] for n in nodes_after]
+    assert node1["id"] not in node_ids_after
+

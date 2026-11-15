@@ -170,6 +170,7 @@ class NodeResponse(BaseModel):
     membership_status: str
     operating_system: str | None
     private_ipv4: str | None
+    cpu_threads: int | None = None
     gpu_vendor: str | None
     gpu_model: str | None
     gpu_vram_bytes: int | None
@@ -179,6 +180,8 @@ class NodeResponse(BaseModel):
     gpu_utilization: float | None
     gpu_used_vram_bytes: int | None
     last_heartbeat_at: datetime | None
+    tasks_completed: int = 0
+    tasks_failed: int = 0
 
 
 class HeartbeatRequest(BaseModel):
@@ -383,7 +386,7 @@ def _parse_dt(value) -> datetime | None:
     return dt
 
 
-def node_response(node_doc: dict, membership_status: str) -> NodeResponse:
+def node_response(node_doc: dict, membership_status: str, tasks_completed: int = 0, tasks_failed: int = 0) -> NodeResponse:
     hb = node_doc.get("last_heartbeat_at")
     return NodeResponse(
         id=node_doc["node_id"],
@@ -393,6 +396,7 @@ def node_response(node_doc: dict, membership_status: str) -> NodeResponse:
         membership_status=membership_status,
         operating_system=node_doc.get("operating_system"),
         private_ipv4=node_doc.get("private_ipv4"),
+        cpu_threads=node_doc.get("cpu_threads"),
         gpu_vendor=node_doc.get("gpu_vendor"),
         gpu_model=node_doc.get("gpu_model"),
         gpu_vram_bytes=node_doc.get("gpu_vram_bytes"),
@@ -402,6 +406,8 @@ def node_response(node_doc: dict, membership_status: str) -> NodeResponse:
         gpu_utilization=node_doc.get("gpu_utilization"),
         gpu_used_vram_bytes=node_doc.get("gpu_used_vram_bytes"),
         last_heartbeat_at=_parse_dt(hb),
+        tasks_completed=tasks_completed,
+        tasks_failed=tasks_failed,
     )
 
 
@@ -835,6 +841,27 @@ def revoke_node(cluster_id: str, node_id: str, user: CurrentUser) -> NodeRespons
     return node_response(node_doc, "revoked")
 
 
+@app.delete("/api/v1/clusters/{cluster_id}/members/{node_id}", status_code=status.HTTP_200_OK)
+def hard_delete_node(cluster_id: str, node_id: str, user: CurrentUser) -> dict[str, str]:
+    """Master permanently removes an offline/revoked node from the cluster and DB."""
+    with connection_scope() as db:
+        require_master_cluster(db, cluster_id, user)
+        member = db.cluster_members.find_one({"cluster_id": cluster_id, "node_id": node_id})
+        if member is None:
+            raise HTTPException(status_code=404, detail="Node is not a member of this cluster")
+        node_doc = db.nodes.find_one({"node_id": node_id})
+        if node_doc and node_doc.get("status") == "online":
+            raise HTTPException(status_code=409, detail="Cannot delete an online node. Drain or disconnect it first.")
+        active_task = db.tasks.find_one({"assigned_node_id": node_id, "state": {"$in": ["leased", "running"]}})
+        if active_task:
+            raise HTTPException(status_code=409, detail="Node has active tasks; wait for them to finish or cancel the job.")
+        db.cluster_members.delete_many({"node_id": node_id})
+        db.telemetry_samples.delete_many({"node_id": node_id})
+        db.nodes.delete_one({"node_id": node_id})
+        record_audit(db, user.id, "node.hard_deleted", "node", node_id, "success", {"cluster_id": cluster_id})
+    return {"message": "Node permanently removed from cluster", "node_id": node_id}
+
+
 # ---------------------------------------------------------------------------
 # Nodes
 # ---------------------------------------------------------------------------
@@ -940,7 +967,10 @@ def list_my_worker_nodes(user: CurrentUser) -> list[NodeResponse]:
         for node_doc in nodes:
             m = db.cluster_members.find_one({"node_id": node_doc["node_id"]})
             ms = m["status"] if m else "unpaired"
-            result.append(node_response(node_doc, ms))
+            nid = node_doc["node_id"]
+            tasks_done = db.tasks.count_documents({"assigned_node_id": nid, "state": "succeeded"})
+            tasks_fail = db.tasks.count_documents({"assigned_node_id": nid, "state": "failed"})
+            result.append(node_response(node_doc, ms, tasks_completed=tasks_done, tasks_failed=tasks_fail))
     return result
 
 
@@ -955,6 +985,22 @@ def drain_worker_node(node_id: str, user: CurrentUser) -> NodeResponse:
         m = db.cluster_members.find_one({"node_id": node_id})
         ms = m["status"] if m else "unpaired"
     return node_response(node_doc, ms)
+
+
+@app.delete("/api/v1/worker/nodes/{node_id}", status_code=status.HTTP_200_OK)
+def deregister_worker_node(node_id: str, user: CurrentUser) -> dict[str, str]:
+    with connection_scope() as db:
+        node_doc = require_worker_node(db, node_id, user)
+        if node_doc.get("status") == "online":
+            raise HTTPException(status_code=409, detail="Cannot deregister an online node. Disconnect the worker app first.")
+        active_task = db.tasks.find_one({"assigned_node_id": node_id, "state": {"$in": ["leased", "running"]}})
+        if active_task:
+            raise HTTPException(status_code=409, detail="Node has active tasks in progress")
+        db.cluster_members.delete_many({"node_id": node_id})
+        db.telemetry_samples.delete_many({"node_id": node_id})
+        db.nodes.delete_one({"node_id": node_id})
+        record_audit(db, user.id, "node.deregistered", "node", node_id, "success")
+    return {"message": "Node deregistered successfully", "node_id": node_id}
 
 
 @app.get("/api/v1/worker/download-agent")
@@ -1284,6 +1330,16 @@ def resume_job(job_id: str, user: CurrentUser) -> JobResponse:
 @app.post("/api/v1/jobs/{job_id}/cancel", response_model=JobResponse)
 def cancel_job(job_id: str, user: CurrentUser) -> JobResponse:
     return update_job_state(job_id, user, ("queued", "running", "paused"), "canceled")
+
+
+@app.delete("/api/v1/jobs/{job_id}", status_code=status.HTTP_200_OK)
+def delete_job(job_id: str, user: CurrentUser) -> dict[str, str]:
+    with connection_scope() as db:
+        require_master_job(db, job_id, user)
+        db.tasks.delete_many({"job_id": job_id})
+        db.jobs.delete_one({"job_id": job_id})
+        record_audit(db, user.id, "job.deleted", "job", job_id, "success")
+    return {"message": "Job and associated tasks deleted successfully", "job_id": job_id}
 
 
 # ---------------------------------------------------------------------------

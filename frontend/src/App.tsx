@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, Check, Copy, Cpu, Database, Download, FileText, FileUp, LogOut, Network, Plus, RefreshCw, Settings, ShieldCheck, Wifi, Zap } from "lucide-react";
+import { Activity, Check, Copy, Cpu, Database, Download, FileText, FileUp, LogOut, Network, Plus, RefreshCw, Settings, ShieldCheck, Trash2, Wifi, Zap } from "lucide-react";
 
 type User = { full_name: string; username: string; email: string; roles: string[] };
 type Cluster = { id: string; name: string; status: string; created_at: string };
@@ -8,7 +8,7 @@ type Workload = { id: string; name: string; content_hash: string; size_bytes: nu
 type Job = { id: string; cluster_id: string; workload_id: string | null; name: string; execution_mode: string; scheduling_policy?: string; scheduling_config?: Record<string, unknown>; state: string; task_count: number; succeeded_count: number; failed_count: number; queued_count: number; created_at: string };
 type Task = { id: string; task_key: string; state: string; attempt: number; assigned_node_id: string | null; pinned_node_id?: string | null; started_at?: string | null; completed_at?: string | null; duration_seconds?: number | null; result: Record<string, unknown> | null; error: string | null };
 type FinalResult = { job_id: string; aggregation: string; task_count: number; result_hash: string; results: Array<{ task_key: string; result: Record<string, unknown> }> };
-type Node = { id: string; node_name: string; hostname: string; status: string; membership_status: string; private_ipv4: string | null; gpu_vendor?: string | null; gpu_model: string | null; gpu_vram_bytes: number | null; compute_backend: string | null; cpu_utilization: number | null; ram_utilization: number | null; gpu_utilization: number | null; gpu_used_vram_bytes?: number | null; last_heartbeat_at: string | null };
+type Node = { id: string; node_name: string; hostname: string; status: string; membership_status: string; private_ipv4: string | null; cpu_threads?: number | null; gpu_vendor?: string | null; gpu_model: string | null; gpu_vram_bytes: number | null; compute_backend: string | null; cpu_utilization: number | null; ram_utilization: number | null; gpu_utilization: number | null; gpu_used_vram_bytes?: number | null; last_heartbeat_at: string | null; tasks_completed?: number; tasks_failed?: number };
 type Telemetry = { node_id: string; node_name: string; captured_at: string; source: string; cpu_utilization: number | null; ram_utilization: number | null; gpu_utilization: number | null; gpu_used_vram_bytes: number | null };
 type NetworkReport = { local_private_ipv4: string[]; master_host: string | null; master_port: number; resolution: string; resolved_addresses: string[]; tcp_state: string; latency_ms: number | null; detail: string | null };
 type AuditEvent = { id: string; action: string; scope_type: string; scope_id: string | null; outcome: string; metadata: Record<string, unknown>; created_at: string };
@@ -95,7 +95,7 @@ function ClusterTopology({ nodes, clusterName }: { nodes: Node[]; clusterName: s
   );
 }
 
-function NodeOverview({ nodes, summary, telemetry, jobs, clusters, selectedId, clusterName, setSelectedId, setClusterName, onCreateCluster, onRefresh, onPair, onApprove, onRevoke }: { nodes: Node[]; summary: ClusterSummary | null; telemetry: Telemetry[]; jobs: Job[]; clusters: Cluster[]; selectedId: string; clusterName: string; setSelectedId: (value: string) => void; setClusterName: (value: string) => void; onCreateCluster: (event: React.FormEvent) => void; onRefresh: () => void; onPair: () => void; onApprove: (nodeId: string) => void; onRevoke: (nodeId: string) => void }) {
+function NodeOverview({ nodes, summary, telemetry, jobs, clusters, selectedId, clusterName, setSelectedId, setClusterName, onCreateCluster, onRefresh, onPair, onApprove, onRevoke, onDelete }: { nodes: Node[]; summary: ClusterSummary | null; telemetry: Telemetry[]; jobs: Job[]; clusters: Cluster[]; selectedId: string; clusterName: string; setSelectedId: (value: string) => void; setClusterName: (value: string) => void; onCreateCluster: (event: React.FormEvent) => void; onRefresh: () => void; onPair: () => void; onApprove: (nodeId: string) => void; onRevoke: (nodeId: string) => void; onDelete: (nodeId: string) => void }) {
   const onlineCount = summary?.online_nodes ?? nodes.filter((node) => node.status === "online").length;
   const offlineCount = summary?.offline_nodes ?? nodes.filter((node) => node.status === "offline").length;
   const activeJobs = summary?.active_jobs ?? jobs.filter((job) => ["queued", "running", "paused"].includes(job.state)).length;
@@ -289,13 +289,24 @@ function NodeOverview({ nodes, summary, telemetry, jobs, clusters, selectedId, c
                 </div>
                 <footer>
                   <span>Membership: {node.membership_status}</span>
-                  {node.membership_status === "pending" ? (
-                    <button className="approve-button" onClick={() => onApprove(node.id)}>Approve</button>
-                  ) : node.membership_status === "approved" ? (
-                    <button className="revoke-button" onClick={() => onRevoke(node.id)}>Revoke</button>
-                  ) : (
-                    <span>Access revoked</span>
-                  )}
+                  <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                    {node.membership_status === "pending" ? (
+                      <button className="approve-button" onClick={() => onApprove(node.id)}>Approve</button>
+                    ) : node.membership_status === "approved" ? (
+                      <button className="revoke-button" onClick={() => onRevoke(node.id)}>Revoke</button>
+                    ) : (
+                      <span style={{ color: "#64748b", fontSize: "12px" }}>Access revoked</span>
+                    )}
+                    {node.status !== "online" && (
+                      <button
+                        title="Permanently remove this node record"
+                        onClick={() => onDelete(node.id)}
+                        style={{ background: "transparent", border: "1px solid rgba(239,68,68,0.3)", color: "#ef4444", cursor: "pointer", padding: "4px 8px", borderRadius: "4px", display: "inline-flex", alignItems: "center", gap: "4px", fontSize: "11px" }}
+                      >
+                        <Trash2 size={12} /> Remove
+                      </button>
+                    )}
+                  </div>
                 </footer>
               </article>
             );
@@ -419,8 +430,53 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
     }
   }
 
+  async function deleteJob(jobId: string) {
+    if (!window.confirm("Permanently delete this job and all associated task history?")) return;
+    try {
+      await api(`/api/v1/jobs/${jobId}`, { method: "DELETE", headers });
+      if (selectedJobId === jobId) {
+        setSelectedJobId("");
+        setTasks([]);
+      }
+      onRefresh();
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "Unable to delete job");
+    }
+  }
+
+  function loadPreset(type: "quick5" | "batch20" | "matmul") {
+    if (type === "quick5") {
+      setTaskJson(JSON.stringify([
+        { task_key: "math-01", payload: { operation: "square", value: 4 } },
+        { task_key: "math-02", payload: { operation: "square", value: 16 } },
+        { task_key: "math-03", payload: { operation: "square", value: 64 } },
+        { task_key: "math-04", payload: { operation: "square", value: 256 } },
+        { task_key: "math-05", payload: { operation: "square", value: 1024 } }
+      ], null, 2));
+      setJobName("5 Quick Parallel Computations");
+    } else if (type === "batch20") {
+      const items = Array.from({ length: 20 }, (_, i) => ({
+        task_key: `batch-${String(i + 1).padStart(2, "0")}`,
+        payload: { operation: "square", value: (i + 1) * 7 }
+      }));
+      setTaskJson(JSON.stringify(items, null, 2));
+      setJobName("20 High-Throughput Batch Tasks");
+    } else if (type === "matmul") {
+      setTaskJson(JSON.stringify([
+        { task_key: "matmul-01", payload: { operation: "matmul", matrix_a: [[1, 2], [3, 4]], matrix_b: [[5, 6], [7, 8]] } },
+        { task_key: "matmul-02", payload: { operation: "matmul", matrix_a: [[3, 1], [2, 5]], matrix_b: [[2, 4], [1, 3]] } },
+        { task_key: "matmul-03", payload: { operation: "matmul", matrix_a: [[6, 2], [1, 4]], matrix_b: [[3, 1], [4, 2]] } }
+      ], null, 2));
+      setJobName("GPU Matrix Multiplication Batch");
+    }
+  }
+
   const selectedJob = jobs.find((job) => job.id === selectedJobId);
   const approvedNodes = nodes.filter((n) => n.membership_status === "approved");
+  const onlineApprovedNodes = approvedNodes.filter((n) => n.status === "online");
+  const totalVramGB = (onlineApprovedNodes.reduce((acc, n) => acc + (n.gpu_vram_bytes || 0), 0) / 1e9).toFixed(1);
+  const totalCores = onlineApprovedNodes.reduce((acc, n) => acc + (n.cpu_threads || 1), 0);
+  const detectedGpus = onlineApprovedNodes.map((n) => n.gpu_model).filter((m) => m && m !== "None (CPU Compute)").join(", ");
 
   return (
     <>
@@ -433,12 +489,40 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
         <Zap size={42} className="hero-accent" />
       </section>
 
+      {/* Cluster Readiness Banner */}
+      {onlineApprovedNodes.length === 0 ? (
+        <div style={{ background: "rgba(234, 179, 8, 0.12)", border: "1px solid rgba(234, 179, 8, 0.35)", borderRadius: "8px", padding: "12px 16px", marginBottom: "16px", display: "flex", alignItems: "center", gap: "12px" }}>
+          <span style={{ fontSize: "20px" }}>⚠️</span>
+          <div>
+            <strong style={{ color: "#facc15", fontSize: "14px", display: "block" }}>No Active Workers Online in Cluster</strong>
+            <p style={{ margin: "2px 0 0 0", color: "#cbd5e1", fontSize: "12px" }}>
+              There are currently 0 approved workers online. Any dispatched jobs will wait in <code>queued</code> state until a worker connects from the Worker Console.
+            </p>
+          </div>
+        </div>
+      ) : (
+        <div style={{ background: "rgba(34, 197, 94, 0.12)", border: "1px solid rgba(34, 197, 94, 0.35)", borderRadius: "8px", padding: "12px 16px", marginBottom: "16px", display: "flex", alignItems: "center", gap: "12px" }}>
+          <span style={{ fontSize: "20px" }}>🟢</span>
+          <div>
+            <strong style={{ color: "#4ade80", fontSize: "14px", display: "block" }}>
+              Cluster Ready: {onlineApprovedNodes.length} Active Worker{onlineApprovedNodes.length > 1 ? "s" : ""} Online ({totalCores} CPU Threads · {totalVramGB} GB VRAM)
+            </strong>
+            <p style={{ margin: "2px 0 0 0", color: "#cbd5e1", fontSize: "12px" }}>
+              {detectedGpus ? `Acceleration hardware: ${detectedGpus}. ` : "CPU Compute Nodes. "}Tasks will be leased and executed immediately in parallel!
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className="workload-columns">
         <section className="form-card">
           <div className="card-title">
             <FileUp size={18} />
-            <div><span className="eyebrow">01 / package</span><h2>Upload workload</h2></div>
+            <div><span className="eyebrow">01 / Optional package</span><h2>Upload custom workload</h2></div>
           </div>
+          <p className="muted" style={{ fontSize: "12px", margin: "0 0 12px 0" }}>
+            For custom algorithms. Running benchmarks or quick math? Skip this card and launch directly on the right!
+          </p>
           <form onSubmit={upload}>
             <label>Package name<input value={name} onChange={(event) => setName(event.target.value)} /></label>
             <div className="form-row">
@@ -499,8 +583,19 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
                 ))}
               </div>
             )}
-            <label>Task JSON<textarea value={taskJson} onChange={(event) => setTaskJson(event.target.value)} rows={4} /></label>
-            <button className="primary-button" type="submit">Create task-parallel job</button>
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                <span style={{ fontWeight: 600, fontSize: "13px" }}>Task JSON Input</span>
+                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                  <button type="button" onClick={() => loadPreset("quick5")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#38bdf8", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>⚡ 5 Math</button>
+                  <button type="button" onClick={() => loadPreset("batch20")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#4ade80", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>🚀 20 Batch</button>
+                  <button type="button" onClick={() => loadPreset("matmul")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#facc15", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>🧮 MatMul</button>
+                  <button type="button" onClick={() => setTaskJson("[]")} title="Clear JSON" style={{ fontSize: "11px", padding: "3px 6px", borderRadius: "4px", background: "#1e293b", color: "#94a3b8", border: "1px solid #334155", cursor: "pointer" }}>✕</button>
+                </div>
+              </div>
+              <textarea value={taskJson} onChange={(event) => setTaskJson(event.target.value)} rows={4} style={{ fontFamily: "monospace", fontSize: "12px" }} />
+            </div>
+            <button className="primary-button" type="submit" style={{ marginTop: "10px" }}>Create task-parallel job</button>
           </form>
         </section>
       </div>
@@ -528,7 +623,17 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
                   <span>{job.succeeded_count}/{job.task_count} complete</span>
                   <div><i style={{ width: `${job.task_count ? (job.succeeded_count / job.task_count) * 100 : 0}%` }} /></div>
                 </div>
-                <span className={`job-state ${job.state}`}>{job.state}</span>
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <span className={`job-state ${job.state}`}>{job.state}</span>
+                  <button
+                    type="button"
+                    title="Delete job record"
+                    onClick={(e) => { e.stopPropagation(); void deleteJob(job.id); }}
+                    style={{ background: "transparent", border: "none", color: "#ef4444", cursor: "pointer", padding: "4px", borderRadius: "4px", display: "inline-flex", alignItems: "center" }}
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -545,6 +650,9 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
                 {selectedJob?.state === "completed" && <button className="small-button" onClick={() => void downloadResult()}><Download size={14} /> Result</button>}
                 <button className="secondary-button" onClick={() => void downloadReport("markdown")}><FileText size={14} /> Report (.md)</button>
                 <button className="secondary-button" onClick={() => void downloadReport("json")}><FileText size={14} /> Report (.json)</button>
+                <button className="revoke-button" onClick={() => void deleteJob(selectedJobId)} style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                  <Trash2 size={14} /> Delete job
+                </button>
               </div>
             </div>
             <div className="task-table">
@@ -638,6 +746,16 @@ function WorkerConsoleView({
     }
   }
 
+  async function deregisterNode(nodeId: string) {
+    if (!window.confirm("Permanently remove this offline node record? This clears all telemetry and cluster membership for this device.")) return;
+    try {
+      await api(`/api/v1/worker/nodes/${nodeId}`, { method: "DELETE", headers });
+      await loadMyNodes();
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "Unable to deregister node");
+    }
+  }
+
   async function generatePairingCode() {
     const targetClusterId = selectedClusterId || clusters[0]?.id;
     if (!targetClusterId) {
@@ -678,15 +796,13 @@ function WorkerConsoleView({
 
   return (
     <section className="worker-console-view">
-      {/* Hero Strip */}
-      <section className="hero-strip compact-hero">
-        <div>
-          <span className="eyebrow">Worker Operator</span>
-          <h2>Local Compute Station</h2>
-          <p>Contribute your PC's GPU & CPU compute to the distributed cluster. No programming or developer tools needed.</p>
-        </div>
-        <Cpu size={42} className="hero-accent" />
-      </section>
+      {/* Compact subtitle bar — avoids duplicate heading with topbar */}
+      <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "0 0 18px 0", borderBottom: "1px solid rgba(255,255,255,0.06)", marginBottom: "20px" }}>
+        <Cpu size={15} style={{ color: "#d3f36b", flexShrink: 0 }} />
+        <span style={{ fontSize: "13px", color: "#64748b" }}>
+          Contribute your PC&apos;s GPU &amp; CPU compute to the distributed cluster — no programming or developer tools needed.
+        </span>
+      </div>
 
       {/* Primary 1-Click Desktop App Download Card */}
       <section className="worker-action-card" style={{ border: "1px solid rgba(56, 189, 248, 0.4)", background: "linear-gradient(135deg, rgba(14, 165, 233, 0.1) 0%, rgba(15, 23, 42, 0.6) 100%)" }}>
@@ -888,7 +1004,7 @@ function WorkerConsoleView({
                 <div className="node-icon"><Cpu size={18} /></div>
                 <div>
                   <h3>{node.node_name}</h3>
-                  <span>{node.hostname} · {node.private_ipv4 ?? "No IP"}</span>
+                  <span>{node.hostname}{node.private_ipv4 ? ` · ${node.private_ipv4}` : ""}</span>
                 </div>
                 <span className={`status ${node.status}`}>{node.status}</span>
               </div>
@@ -902,10 +1018,29 @@ function WorkerConsoleView({
                 <Metric label="RAM" value={node.ram_utilization == null ? "Unavailable" : `${node.ram_utilization.toFixed(1)}%`} />
                 <Metric label="Status" value={node.status} tone={node.status === "online" ? "green" : "muted"} />
               </div>
+              {/* Task Contribution Stats */}
+              <div style={{ display: "flex", alignItems: "center", gap: "10px", padding: "8px 0 4px 0", borderTop: "1px solid rgba(255,255,255,0.05)", marginTop: "4px" }}>
+                <span style={{ fontSize: "12px", color: "#64748b" }}>Tasks Processed:</span>
+                <span style={{ fontSize: "12px", fontWeight: 700, color: (node.tasks_completed ?? 0) > 0 ? "#4ade80" : "#64748b" }}>
+                  {node.tasks_completed ?? 0} completed
+                  {(node.tasks_failed ?? 0) > 0 && <span style={{ color: "#f87171", marginLeft: "6px" }}>· {node.tasks_failed} failed</span>}
+                </span>
+                <span style={{ marginLeft: "auto", fontSize: "11px", padding: "2px 7px", borderRadius: "12px", background: (node.tasks_completed ?? 0) > 0 ? "rgba(74,222,128,0.12)" : "rgba(100,116,139,0.12)", color: (node.tasks_completed ?? 0) > 0 ? "#4ade80" : "#64748b", fontWeight: 600 }}>
+                  {(node.tasks_completed ?? 0) > 0 ? "Active Contributor" : "Standby"}
+                </span>
+              </div>
               <footer>
                 <span>Cluster: {node.membership_status}</span>
-                {node.status === "online" && (
+                {node.status === "online" ? (
                   <button className="drain-btn" onClick={() => void drainNode(node.id)}>Safe Drain</button>
+                ) : (
+                  <button
+                    className="revoke-button"
+                    onClick={() => void deregisterNode(node.id)}
+                    style={{ display: "inline-flex", alignItems: "center", gap: "5px", fontSize: "12px", padding: "5px 10px" }}
+                  >
+                    <Trash2 size={13} /> Deregister
+                  </button>
                 )}
               </footer>
             </article>
@@ -1033,6 +1168,16 @@ function Dashboard({ token, user, onLogout }: { token: string; user: User; onLog
     }
   }
 
+  async function deleteNode(nodeId: string) {
+    if (!window.confirm("Permanently remove this offline node from the cluster? This deletes all telemetry and membership records for this device.")) return;
+    try {
+      await api(`/api/v1/clusters/${selectedId}/members/${nodeId}`, { method: "DELETE", headers });
+      await loadNodes();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to remove node");
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -1108,6 +1253,7 @@ function Dashboard({ token, user, onLogout }: { token: string; user: User; onLog
             onPair={() => void createPairingCode()}
             onApprove={(nodeId) => void approveNode(nodeId)}
             onRevoke={(nodeId) => void revokeNode(nodeId)}
+            onDelete={(nodeId) => void deleteNode(nodeId)}
           />
         ) : view === "workloads" ? (
           <WorkloadsView

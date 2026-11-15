@@ -75,6 +75,12 @@ def execute_task_with_backend(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def execute_task_isolated(payload: Mapping[str, Any], timeout_seconds: float = 30.0) -> dict[str, Any]:
     """Run only the built-in adapter in a bounded child process."""
+    if getattr(sys, "frozen", False) or "NEXORA-Worker" in sys.executable:
+        # In a bundled PyInstaller executable, sys.executable is the desktop app itself.
+        # Spawning sys.executable would recursively launch new GUI windows!
+        # Execute safely in-process using the validated adapter:
+        return execute_task_with_backend(payload)
+
     serialized_payload = json.dumps(payload).encode()
     if len(serialized_payload) > MAX_TASK_JSON_BYTES:
         raise ValueError("Task payload exceeds the execution input limit")
