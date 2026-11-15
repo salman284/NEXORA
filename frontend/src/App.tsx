@@ -6,7 +6,7 @@ type Cluster = { id: string; name: string; status: string; created_at: string };
 type PairingCode = { code: string; expires_at: string };
 type Workload = { id: string; name: string; content_hash: string; size_bytes: number; validation_state: string; manifest: { operation: string; backend: string; execution_mode: string }; created_at: string };
 type Job = { id: string; cluster_id: string; workload_id: string | null; name: string; execution_mode: string; scheduling_policy?: string; scheduling_config?: Record<string, unknown>; state: string; task_count: number; succeeded_count: number; failed_count: number; queued_count: number; created_at: string };
-type Task = { id: string; task_key: string; state: string; attempt: number; assigned_node_id: string | null; pinned_node_id?: string | null; started_at?: string | null; completed_at?: string | null; duration_seconds?: number | null; result: Record<string, unknown> | null; error: string | null };
+type Task = { id: string; job_id?: string; workload_id?: string | null; task_key: string; state: string; attempt: number; assigned_node_id: string | null; assigned_node_name?: string | null; pinned_node_id?: string | null; started_at?: string | null; completed_at?: string | null; duration_seconds?: number | null; result: Record<string, unknown> | null; error: string | null; has_artifacts?: boolean; artifact_size_bytes?: number | null; };
 type FinalResult = { job_id: string; aggregation: string; task_count: number; result_hash: string; results: Array<{ task_key: string; result: Record<string, unknown> }> };
 type Node = { id: string; node_name: string; hostname: string; status: string; membership_status: string; private_ipv4: string | null; cpu_threads?: number | null; gpu_vendor?: string | null; gpu_model: string | null; gpu_vram_bytes: number | null; compute_backend: string | null; cpu_utilization: number | null; ram_utilization: number | null; gpu_utilization: number | null; gpu_used_vram_bytes?: number | null; last_heartbeat_at: string | null; tasks_completed?: number; tasks_failed?: number };
 type Telemetry = { node_id: string; node_name: string; captured_at: string; source: string; cpu_utilization: number | null; ram_utilization: number | null; gpu_utilization: number | null; gpu_used_vram_bytes: number | null };
@@ -317,31 +317,105 @@ function NodeOverview({ nodes, summary, telemetry, jobs, clusters, selectedId, c
   );
 }
 
-function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, onError }: { token: string; clusterId: string; nodes: Node[]; workloads: Workload[]; jobs: Job[]; onRefresh: () => void; onError: (message: string) => void }) {
+function WorkloadsView({
+  token,
+  clusterId,
+  nodes,
+  workloads,
+  jobs,
+  onRefresh,
+  onError,
+  onNavigate,
+}: {
+  token: string;
+  clusterId: string;
+  nodes: Node[];
+  workloads: Workload[];
+  jobs: Job[];
+  onRefresh: () => void;
+  onError: (message: string) => void;
+  onNavigate?: (tab: "overview" | "workloads" | "worker" | "network" | "audit" | "settings") => void;
+}) {
+  const approvedNodes = nodes.filter((n) => n.membership_status === "approved");
+  const onlineApprovedNodes = approvedNodes.filter((n) => n.status === "online");
+  const onlineGpuNodes = onlineApprovedNodes.filter((n) => n.gpu_model && n.gpu_model !== "None (CPU Compute)");
+  const totalVramGB = (onlineApprovedNodes.reduce((acc, n) => acc + (n.gpu_vram_bytes || 0), 0) / 1e9).toFixed(1);
+  const totalCores = onlineApprovedNodes.reduce((acc, n) => acc + (n.cpu_threads || 1), 0);
+  const detectedGpus = onlineApprovedNodes.map((n) => n.gpu_model).filter((m) => m && m !== "None (CPU Compute)").join(", ");
+
   const [name, setName] = useState("Square batch");
   const [operation, setOperation] = useState("square");
   const [backend, setBackend] = useState("cpu");
   const [file, setFile] = useState<File | null>(null);
   const [selectedWorkload, setSelectedWorkload] = useState("");
+  const [dispatchMode, setDispatchMode] = useState<"single" | "auto" | "manual" | "advanced">("auto");
+  const [singleTaskKey, setSingleTaskKey] = useState("main-run");
+  const [autoTargetGpuOnly, setAutoTargetGpuOnly] = useState(true);
+  const [autoSliceCount, setAutoSliceCount] = useState(2);
+  const [hasUserCustomizedSlices, setHasUserCustomizedSlices] = useState(false);
+  const [manualSelectedNodeIds, setManualSelectedNodeIds] = useState<string[]>([]);
   const [taskJson, setTaskJson] = useState('[{"task_key":"item-1","payload":{"operation":"square","value":2}}]');
-  const [jobName, setJobName] = useState("First distributed batch");
+  const [jobName, setJobName] = useState("Distributed Execution Batch");
   const [schedulingPolicy, setSchedulingPolicy] = useState<"automatic" | "manual" | "hybrid">("automatic");
   const [allocations, setAllocations] = useState<Record<string, number>>({});
   const [busy, setBusy] = useState(false);
   const [selectedJobId, setSelectedJobId] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [selectedErrorTask, setSelectedErrorTask] = useState<Task | null>(null);
   const headers = { Authorization: `Bearer ${token}` };
+
+  // Dynamic Optimal Slice Count calculation based on active GPU/CPU hardware
+  const recommendedSliceCount = useMemo(() => {
+    if (autoTargetGpuOnly) {
+      return Math.max(1, onlineGpuNodes.length || onlineApprovedNodes.length || 2);
+    } else {
+      return Math.max(1, onlineApprovedNodes.length || 2);
+    }
+  }, [autoTargetGpuOnly, onlineGpuNodes.length, onlineApprovedNodes.length]);
+
+  // Keep autoSliceCount in sync with cluster optimal hardware capacity unless customized
+  useEffect(() => {
+    if (!hasUserCustomizedSlices && recommendedSliceCount > 0) {
+      setAutoSliceCount(recommendedSliceCount);
+    }
+  }, [recommendedSliceCount, hasUserCustomizedSlices]);
+
+  useEffect(() => {
+    if (manualSelectedNodeIds.length === 0 && approvedNodes.length > 0) {
+      setManualSelectedNodeIds(approvedNodes.map((n) => n.id));
+    }
+  }, [approvedNodes]);
 
   async function upload(event: React.FormEvent) {
     event.preventDefault();
-    if (!file) { onError("Choose a ZIP package first"); return; }
+    if (!file) { onError("Choose a notebook (.ipynb), script (.py), or ZIP package first"); return; }
     setBusy(true);
     try {
+      const ext = file.name.split(".").pop()?.toLowerCase() || "";
+      const isNb = ext === "ipynb";
+      const isPy = ext === "py";
+      const runtime = isNb ? "notebook" : isPy ? "script" : "builtin";
+      const op = isNb ? "execute_notebook" : isPy ? "execute_script" : operation;
+
       const body = new FormData();
-      body.append("manifest", JSON.stringify({ schema_version: "1", name, runtime: "builtin", backend, execution_mode: "task_parallel", operation, aggregation: "collect" }));
+      body.append("manifest", JSON.stringify({
+        schema_version: "1",
+        name: name || file.name.replace(/\.[^/.]+$/, ""),
+        runtime,
+        backend,
+        execution_mode: "task_parallel",
+        operation: op,
+        entrypoint: file.name,
+        aggregation: "bundle"
+      }));
       body.append("file", file);
-      await api<Workload>("/api/v1/workloads", { method: "POST", headers, body });
+      const created = await api<Workload>("/api/v1/workloads", { method: "POST", headers, body });
       setFile(null);
+      if (created?.id) {
+        setSelectedWorkload(created.id);
+        const autoName = name || file.name.replace(/\.[^/.]+$/, "");
+        setJobName(autoName);
+      }
       onRefresh();
     } catch (requestError) {
       onError(requestError instanceof Error ? requestError.message : "Upload failed");
@@ -354,16 +428,60 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
     event.preventDefault();
     if (!clusterId) { onError("Select or create a cluster first"); return; }
     try {
-      const parsedTasks = JSON.parse(taskJson);
+      let parsedTasks: any[] = [];
+      let finalPolicy: "automatic" | "manual" | "hybrid" = "automatic";
+      let finalConfig: Record<string, any> = {};
+
+      if (dispatchMode === "single") {
+        parsedTasks = [{
+          task_key: singleTaskKey.trim() || "main-run",
+          payload: { worker_index: 0, total_workers: 1, mode: "single" }
+        }];
+        finalPolicy = "automatic";
+      } else if (dispatchMode === "auto") {
+        const count = Math.max(1, Math.min(64, autoSliceCount || 2));
+        parsedTasks = Array.from({ length: count }, (_, i) => ({
+          task_key: `slice-${i + 1}`,
+          payload: {
+            worker_index: i,
+            total_workers: count,
+            slice: i + 1,
+            target_hardware: autoTargetGpuOnly ? "gpu" : "any"
+          }
+        }));
+        finalPolicy = "automatic";
+      } else if (dispatchMode === "manual") {
+        const targetNodes = approvedNodes.filter((n) => manualSelectedNodeIds.includes(n.id));
+        if (targetNodes.length === 0) {
+          onError("Select at least one worker node from the list");
+          return;
+        }
+        parsedTasks = targetNodes.map((n, i) => ({
+          task_key: `worker-${i + 1}-${n.node_name.toLowerCase().replace(/[^a-z0-9]/g, "_")}`,
+          payload: {
+            worker_index: i,
+            total_workers: targetNodes.length,
+            assigned_node: n.node_name
+          },
+          pinned_node_id: n.id
+        }));
+        finalPolicy = "manual";
+      } else {
+        // Advanced JSON mode
+        parsedTasks = JSON.parse(taskJson);
+        finalPolicy = schedulingPolicy;
+        finalConfig = { allocations };
+      }
+
       await api<Job>("/api/v1/jobs", {
         method: "POST",
         headers,
         body: JSON.stringify({
           cluster_id: clusterId,
           workload_id: selectedWorkload || null,
-          name: jobName,
-          scheduling_policy: schedulingPolicy,
-          scheduling_config: { allocations },
+          name: jobName.trim() || "Distributed Job",
+          scheduling_policy: finalPolicy,
+          scheduling_config: finalConfig,
           tasks: parsedTasks,
         }),
       });
@@ -430,6 +548,38 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
     }
   }
 
+  async function downloadBundle(jobId: string) {
+    try {
+      const resp = await fetch(`/api/v1/jobs/${jobId}/bundle`, { headers });
+      if (!resp.ok) throw new Error("Output bundle is not available yet");
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `nexora-${jobId.slice(0, 8)}-output-bundle.zip`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "Unable to download output bundle");
+    }
+  }
+
+  async function downloadTaskArtifacts(taskId: string, taskKey: string) {
+    try {
+      const resp = await fetch(`/api/v1/tasks/${taskId}/artifacts`, { headers });
+      if (!resp.ok) throw new Error("Artifacts not available for this task");
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `nexora-${taskKey}-artifacts.zip`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : "Unable to download task artifacts");
+    }
+  }
+
   async function deleteJob(jobId: string) {
     if (!window.confirm("Permanently delete this job and all associated task history?")) return;
     try {
@@ -444,8 +594,16 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
     }
   }
 
-  function loadPreset(type: "quick5" | "batch20" | "matmul") {
-    if (type === "quick5") {
+  function loadPreset(type: "quick5" | "batch20" | "matmul" | "ml4gpu") {
+    if (type === "ml4gpu") {
+      setTaskJson(JSON.stringify([
+        { task_key: "fold-1-gpu", payload: { operation: "execute_script", fold: 1, code: "import json, pickle, time\ntime.sleep(1)\nwith open('task_input.json') as f: params = json.load(f)\nmodel = {'fold': params.get('fold'), 'val_accuracy': 0.942, 'weights': [0.12, 0.45, 0.89]}\nwith open('model_fold1.pkl', 'wb') as f: pickle.dump(model, f)\nwith open('metrics_fold1.json', 'w') as f: json.dump(model, f)\nprint('Fold 1 Training Complete! Saved model_fold1.pkl & metrics_fold1.json')\n" } },
+        { task_key: "fold-2-gpu", payload: { operation: "execute_script", fold: 2, code: "import json, pickle, time\ntime.sleep(1)\nwith open('task_input.json') as f: params = json.load(f)\nmodel = {'fold': params.get('fold'), 'val_accuracy': 0.958, 'weights': [0.22, 0.55, 0.81]}\nwith open('model_fold2.pkl', 'wb') as f: pickle.dump(model, f)\nwith open('metrics_fold2.json', 'w') as f: json.dump(model, f)\nprint('Fold 2 Training Complete! Saved model_fold2.pkl & metrics_fold2.json')\n" } },
+        { task_key: "fold-3-gpu", payload: { operation: "execute_script", fold: 3, code: "import json, pickle, time\ntime.sleep(1)\nwith open('task_input.json') as f: params = json.load(f)\nmodel = {'fold': params.get('fold'), 'val_accuracy': 0.963, 'weights': [0.32, 0.61, 0.74]}\nwith open('model_fold3.pkl', 'wb') as f: pickle.dump(model, f)\nwith open('metrics_fold3.json', 'w') as f: json.dump(model, f)\nprint('Fold 3 Training Complete! Saved model_fold3.pkl & metrics_fold3.json')\n" } },
+        { task_key: "fold-4-gpu", payload: { operation: "execute_script", fold: 4, code: "import json, pickle, time\ntime.sleep(1)\nwith open('task_input.json') as f: params = json.load(f)\nmodel = {'fold': params.get('fold'), 'val_accuracy': 0.971, 'weights': [0.42, 0.73, 0.68]}\nwith open('model_fold4.pkl', 'wb') as f: pickle.dump(model, f)\nwith open('metrics_fold4.json', 'w') as f: json.dump(model, f)\nprint('Fold 4 Training Complete! Saved model_fold4.pkl & metrics_fold4.json')\n" } }
+      ], null, 2));
+      setJobName("4-Worker Distributed ML Fold Training");
+    } else if (type === "quick5") {
       setTaskJson(JSON.stringify([
         { task_key: "math-01", payload: { operation: "square", value: 4 } },
         { task_key: "math-02", payload: { operation: "square", value: 16 } },
@@ -472,11 +630,6 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
   }
 
   const selectedJob = jobs.find((job) => job.id === selectedJobId);
-  const approvedNodes = nodes.filter((n) => n.membership_status === "approved");
-  const onlineApprovedNodes = approvedNodes.filter((n) => n.status === "online");
-  const totalVramGB = (onlineApprovedNodes.reduce((acc, n) => acc + (n.gpu_vram_bytes || 0), 0) / 1e9).toFixed(1);
-  const totalCores = onlineApprovedNodes.reduce((acc, n) => acc + (n.cpu_threads || 1), 0);
-  const detectedGpus = onlineApprovedNodes.map((n) => n.gpu_model).filter((m) => m && m !== "None (CPU Compute)").join(", ");
 
   return (
     <>
@@ -491,14 +644,38 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
 
       {/* Cluster Readiness Banner */}
       {onlineApprovedNodes.length === 0 ? (
-        <div style={{ background: "rgba(234, 179, 8, 0.12)", border: "1px solid rgba(234, 179, 8, 0.35)", borderRadius: "8px", padding: "12px 16px", marginBottom: "16px", display: "flex", alignItems: "center", gap: "12px" }}>
-          <span style={{ fontSize: "20px" }}>⚠️</span>
-          <div>
-            <strong style={{ color: "#facc15", fontSize: "14px", display: "block" }}>No Active Workers Online in Cluster</strong>
-            <p style={{ margin: "2px 0 0 0", color: "#cbd5e1", fontSize: "12px" }}>
-              There are currently 0 approved workers online. Any dispatched jobs will wait in <code>queued</code> state until a worker connects from the Worker Console.
-            </p>
+        <div style={{ background: "rgba(234, 179, 8, 0.12)", border: "1px solid rgba(234, 179, 8, 0.35)", borderRadius: "8px", padding: "12px 16px", marginBottom: "16px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <span style={{ fontSize: "20px" }}>⚠️</span>
+            <div>
+              <strong style={{ color: "#facc15", fontSize: "14px", display: "block" }}>No Active Workers Online in Cluster</strong>
+              <p style={{ margin: "2px 0 0 0", color: "#cbd5e1", fontSize: "12px" }}>
+                There are currently 0 approved workers online. Any dispatched jobs will wait in <code>queued</code> state until a worker connects from the Worker Console.
+              </p>
+            </div>
           </div>
+          {onNavigate && (
+            <button
+              type="button"
+              onClick={() => onNavigate("worker")}
+              style={{
+                background: "#facc15",
+                color: "#0f172a",
+                border: "none",
+                borderRadius: "6px",
+                padding: "8px 14px",
+                fontWeight: 700,
+                cursor: "pointer",
+                fontSize: "12px",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+                flexShrink: 0
+              }}
+            >
+              Open Worker Console →
+            </button>
+          )}
         </div>
       ) : (
         <div style={{ background: "rgba(34, 197, 94, 0.12)", border: "1px solid rgba(34, 197, 94, 0.35)", borderRadius: "8px", padding: "12px 16px", marginBottom: "16px", display: "flex", alignItems: "center", gap: "12px" }}>
@@ -518,31 +695,81 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
         <section className="form-card">
           <div className="card-title">
             <FileUp size={18} />
-            <div><span className="eyebrow">01 / Optional package</span><h2>Upload custom workload</h2></div>
+            <div><span className="eyebrow">01 / Notebook & Script Package</span><h2>Upload code / notebook</h2></div>
           </div>
           <p className="muted" style={{ fontSize: "12px", margin: "0 0 12px 0" }}>
-            For custom algorithms. Running benchmarks or quick math? Skip this card and launch directly on the right!
+            Upload <strong>Jupyter Notebook (.ipynb)</strong>, <strong>Python script (.py)</strong>, or a <strong>ZIP bundle</strong>. Distributed worker GPUs will execute tasks in parallel and merge all output models/artifacts into a single downloadable ZIP!
           </p>
           <form onSubmit={upload}>
-            <label>Package name<input value={name} onChange={(event) => setName(event.target.value)} /></label>
-            <div className="form-row">
-              <label>Operation
-                <select value={operation} onChange={(event) => setOperation(event.target.value)}>
-                  <option value="square">square</option>
-                  <option value="sum">sum</option>
-                  <option value="matmul">matmul (Matrix Multiply)</option>
-                  <option value="identity">identity</option>
-                </select>
-              </label>
-              <label>Backend
-                <select value={backend} onChange={(event) => setBackend(event.target.value)}>
-                  <option value="cpu">CPU</option>
-                  <option value="opencl">OpenCL</option>
-                </select>
-              </label>
-            </div>
-            <label className="file-input">ZIP package<input type="file" accept=".zip,application/zip" onChange={(event) => setFile(event.target.files?.[0] ?? null)} /></label>
-            <button className="primary-button" disabled={busy} type="submit">{busy ? "Validating…" : "Validate and store"}</button>
+            <label className="file-input">
+              Choose Notebook / Script / ZIP
+              <input
+                type="file"
+                accept=".zip,.ipynb,.py,application/zip"
+                onChange={(event) => {
+                  const f = event.target.files?.[0] ?? null;
+                  setFile(f);
+                  if (f) {
+                    const base = f.name.replace(/\.[^/.]+$/, "");
+                    setName(base);
+                    setJobName(base);
+                    const ext = f.name.split(".").pop()?.toLowerCase() || "";
+                    if (ext === "ipynb") setOperation("execute_notebook");
+                    else if (ext === "py") setOperation("execute_script");
+                  }
+                }}
+              />
+            </label>
+
+            {file && (
+              <div style={{ background: "rgba(56, 189, 248, 0.1)", border: "1px solid rgba(56, 189, 248, 0.3)", borderRadius: "6px", padding: "8px 12px", margin: "10px 0", fontSize: "12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <strong style={{ color: "#38bdf8", display: "block" }}>
+                    {file.name.endsWith(".ipynb") ? "📓 Jupyter Notebook" : file.name.endsWith(".py") ? "🐍 Python Script" : "📦 ZIP Archive"} Selected
+                  </strong>
+                  <span style={{ color: "#cbd5e1", fontSize: "11px" }}>{file.name} ({(file.size / 1024).toFixed(1)} KB)</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => { setFile(null); }}
+                  style={{ background: "transparent", border: "none", color: "#94a3b8", cursor: "pointer", fontSize: "14px", fontWeight: 700 }}
+                  title="Remove selected file"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            <label>Package / Algorithm name<input value={name} onChange={(event) => setName(event.target.value)} /></label>
+
+            {!file || (!file.name.endsWith(".ipynb") && !file.name.endsWith(".py")) ? (
+              <div className="form-row">
+                <label>Operation
+                  <select value={operation} onChange={(event) => setOperation(event.target.value)}>
+                    <option value="execute_script">execute_script (Python)</option>
+                    <option value="execute_notebook">execute_notebook (Jupyter)</option>
+                    <option value="square">square (Built-in Demo)</option>
+                    <option value="sum">sum (Built-in Demo)</option>
+                    <option value="matmul">matmul (GPU Matrix)</option>
+                    <option value="identity">identity</option>
+                  </select>
+                </label>
+                <label>Backend
+                  <select value={backend} onChange={(event) => setBackend(event.target.value)}>
+                    <option value="cpu">CPU</option>
+                    <option value="opencl">OpenCL</option>
+                  </select>
+                </label>
+              </div>
+            ) : (
+              <div style={{ margin: "8px 0 12px 0", fontSize: "11px", color: "#4ade80" }}>
+                ✓ Custom code execution mode active: All generated models, weights, tables, plots & output notebook will be captured.
+              </div>
+            )}
+
+            <button className="primary-button" disabled={busy} type="submit">
+              {busy ? "Validating & Uploading…" : (file ? "Upload & Register Workload" : "Validate and store")}
+            </button>
           </form>
         </section>
 
@@ -559,43 +786,330 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
                 {workloads.map((workload) => <option key={workload.id} value={workload.id}>{workload.name} · {workload.manifest.backend}</option>)}
               </select>
             </label>
-            <label>Scheduling Mode
-              <select value={schedulingPolicy} onChange={(event) => setSchedulingPolicy(event.target.value as any)}>
-                <option value="automatic">Mode A: Automatic (Dynamic based on VRAM/GPU/CPU)</option>
-                <option value="manual">Mode B: Manual Distribution (Target specific Workers)</option>
-                <option value="hybrid">Mode C: Hybrid (Target Workers for subset, auto-distribute rest)</option>
-              </select>
-            </label>
-            {schedulingPolicy !== "automatic" && (
-              <div className="allocation-box">
-                <span className="eyebrow">Worker Allocation Targets (% or task count)</span>
-                {approvedNodes.length === 0 ? <small className="muted">No approved workers in cluster.</small> : approvedNodes.map((n) => (
-                  <div key={n.id} className="allocation-item">
-                    <span>{n.node_name} ({n.gpu_model || "CPU"})</span>
+            {/* Dispatch Strategy Selector */}
+            <div style={{ marginTop: "14px", marginBottom: "12px" }}>
+              <span style={{ fontSize: "11px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "#94a3b8", display: "block", marginBottom: "6px" }}>
+                Distribution Strategy
+              </span>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "5px", marginBottom: "10px" }}>
+                <button
+                  type="button"
+                  onClick={() => setDispatchMode("single")}
+                  style={{
+                    padding: "8px 4px",
+                    borderRadius: "6px",
+                    border: dispatchMode === "single" ? "1px solid #d3f36b" : "1px solid #334155",
+                    background: dispatchMode === "single" ? "rgba(211, 243, 107, 0.15)" : "#0f172a",
+                    color: dispatchMode === "single" ? "#d3f36b" : "#94a3b8",
+                    fontWeight: 700,
+                    fontSize: "11px",
+                    cursor: "pointer",
+                    textAlign: "center"
+                  }}
+                >
+                  ⚡ Single Run
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDispatchMode("auto")}
+                  style={{
+                    padding: "8px 4px",
+                    borderRadius: "6px",
+                    border: dispatchMode === "auto" ? "1px solid #d3f36b" : "1px solid #334155",
+                    background: dispatchMode === "auto" ? "rgba(211, 243, 107, 0.15)" : "#0f172a",
+                    color: dispatchMode === "auto" ? "#d3f36b" : "#94a3b8",
+                    fontWeight: 700,
+                    fontSize: "11px",
+                    cursor: "pointer",
+                    textAlign: "center"
+                  }}
+                >
+                  🤖 Auto-Split
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDispatchMode("manual")}
+                  style={{
+                    padding: "8px 4px",
+                    borderRadius: "6px",
+                    border: dispatchMode === "manual" ? "1px solid #d3f36b" : "1px solid #334155",
+                    background: dispatchMode === "manual" ? "rgba(211, 243, 107, 0.15)" : "#0f172a",
+                    color: dispatchMode === "manual" ? "#d3f36b" : "#94a3b8",
+                    fontWeight: 700,
+                    fontSize: "11px",
+                    cursor: "pointer",
+                    textAlign: "center"
+                  }}
+                >
+                  🎛️ Manual Pick
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDispatchMode("advanced")}
+                  style={{
+                    padding: "8px 4px",
+                    borderRadius: "6px",
+                    border: dispatchMode === "advanced" ? "1px solid #d3f36b" : "1px solid #334155",
+                    background: dispatchMode === "advanced" ? "rgba(211, 243, 107, 0.15)" : "#0f172a",
+                    color: dispatchMode === "advanced" ? "#d3f36b" : "#94a3b8",
+                    fontWeight: 700,
+                    fontSize: "11px",
+                    cursor: "pointer",
+                    textAlign: "center"
+                  }}
+                >
+                  ⚙️ JSON Mode
+                </button>
+              </div>
+
+              {/* Mode 1: Single Run */}
+              {dispatchMode === "single" && (
+                <div style={{ background: "rgba(15, 23, 42, 0.6)", border: "1px dashed #334155", borderRadius: "8px", padding: "12px 14px", marginBottom: "8px" }}>
+                  <label style={{ display: "grid", gap: "6px", fontSize: "12px", color: "#94a3b8" }}>
+                    <span>Run Tag / Label (Optional)</span>
                     <input
-                      type="number"
-                      min="0"
-                      placeholder="Share / %"
-                      value={allocations[n.id] ?? ""}
-                      onChange={(e) => setAllocations({ ...allocations, [n.id]: Number(e.target.value) })}
+                      value={singleTaskKey}
+                      onChange={(e) => setSingleTaskKey(e.target.value)}
+                      placeholder="e.g. main-run or experiment-1"
+                      style={{ width: "100%" }}
                     />
-                  </div>
-                ))}
-              </div>
-            )}
-            <div>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                <span style={{ fontWeight: 600, fontSize: "13px" }}>Task JSON Input</span>
-                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-                  <button type="button" onClick={() => loadPreset("quick5")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#38bdf8", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>⚡ 5 Math</button>
-                  <button type="button" onClick={() => loadPreset("batch20")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#4ade80", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>🚀 20 Batch</button>
-                  <button type="button" onClick={() => loadPreset("matmul")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#facc15", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>🧮 MatMul</button>
-                  <button type="button" onClick={() => setTaskJson("[]")} title="Clear JSON" style={{ fontSize: "11px", padding: "3px 6px", borderRadius: "4px", background: "#1e293b", color: "#94a3b8", border: "1px solid #334155", cursor: "pointer" }}>✕</button>
+                  </label>
+                  <small style={{ color: "#a3e635", fontSize: "11px", display: "block", marginTop: "8px" }}>
+                    ✓ 1-Click Execution: Master will automatically lease this task to the best online GPU/CPU worker. All output files (.pkl, .pt, .png, etc.) will be bundled into a final ZIP.
+                  </small>
                 </div>
-              </div>
-              <textarea value={taskJson} onChange={(event) => setTaskJson(event.target.value)} rows={4} style={{ fontFamily: "monospace", fontSize: "12px" }} />
+              )}
+
+              {/* Mode 2: Auto-Distribute (Smart GPU aware) */}
+              {dispatchMode === "auto" && (
+                <div style={{ background: "rgba(15, 23, 42, 0.6)", border: "1px solid #334155", borderRadius: "8px", padding: "12px 14px", marginBottom: "8px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#38bdf8" }}>
+                      🤖 Smart Auto-Distribution
+                    </span>
+                    <span style={{ fontSize: "11px", color: "#94a3b8" }}>
+                      Online: {onlineApprovedNodes.length} Nodes ({detectedGpus || "CPU nodes"})
+                    </span>
+                  </div>
+
+                  {/* Recommendation Callout */}
+                  <div style={{ background: "rgba(56, 189, 248, 0.1)", border: "1px solid rgba(56, 189, 248, 0.3)", borderRadius: "6px", padding: "8px 12px", marginBottom: "10px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }}>
+                    <div>
+                      <span style={{ color: "#38bdf8", fontSize: "12px", fontWeight: 700, display: "flex", alignItems: "center", gap: "6px" }}>
+                        ✨ Best Recommendation: {recommendedSliceCount} Parallel Slices
+                      </span>
+                      <span style={{ color: "#cbd5e1", fontSize: "11px", display: "block", marginTop: "2px" }}>
+                        {autoTargetGpuOnly
+                          ? (onlineGpuNodes.length > 0
+                              ? `1 parallel slice per active GPU (${onlineGpuNodes.map((n) => n.node_name).join(", ")}) for zero idle time`
+                              : `Auto-balanced across online CPU nodes`)
+                          : `1 parallel slice per online worker node (${onlineApprovedNodes.length} active machines)`}
+                      </span>
+                    </div>
+                    {autoSliceCount !== recommendedSliceCount && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAutoSliceCount(recommendedSliceCount);
+                          setHasUserCustomizedSlices(false);
+                        }}
+                        style={{
+                          background: "#38bdf8",
+                          color: "#0f172a",
+                          border: "none",
+                          borderRadius: "4px",
+                          padding: "4px 8px",
+                          fontSize: "11px",
+                          fontWeight: 700,
+                          cursor: "pointer",
+                          flexShrink: 0,
+                          whiteSpace: "nowrap"
+                        }}
+                      >
+                        Use {recommendedSliceCount}
+                      </button>
+                    )}
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "10px" }}>
+                    <label style={{ display: "grid", gap: "4px", fontSize: "12px", color: "#cbd5e1" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span>Parallel Slices (Tasks)</span>
+                        {autoSliceCount === recommendedSliceCount && (
+                          <span style={{ fontSize: "10px", color: "#38bdf8", fontWeight: 700, background: "rgba(56, 189, 248, 0.2)", padding: "1px 6px", borderRadius: "10px" }}>
+                            Optimal
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ display: "flex", gap: "6px" }}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setHasUserCustomizedSlices(true);
+                            setAutoSliceCount(Math.max(1, autoSliceCount - 1));
+                          }}
+                          style={{ padding: "0 10px", background: "#1e293b", color: "#f1f5f9", border: "1px solid #334155", borderRadius: "6px", cursor: "pointer", fontWeight: 700 }}
+                        >
+                          -
+                        </button>
+                        <input
+                          type="number"
+                          min="1"
+                          max="64"
+                          value={autoSliceCount}
+                          onChange={(e) => {
+                            setHasUserCustomizedSlices(true);
+                            setAutoSliceCount(Number(e.target.value));
+                          }}
+                          style={{ width: "100%", textAlign: "center" }}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setHasUserCustomizedSlices(true);
+                            setAutoSliceCount(Math.min(64, autoSliceCount + 1));
+                          }}
+                          style={{ padding: "0 10px", background: "#1e293b", color: "#f1f5f9", border: "1px solid #334155", borderRadius: "6px", cursor: "pointer", fontWeight: 700 }}
+                        >
+                          +
+                        </button>
+                      </div>
+                    </label>
+                    <label style={{ display: "grid", gap: "4px", fontSize: "12px", color: "#cbd5e1" }}>
+                      <span>Hardware Target</span>
+                      <select
+                        value={autoTargetGpuOnly ? "gpu" : "any"}
+                        onChange={(e) => setAutoTargetGpuOnly(e.target.value === "gpu")}
+                        style={{ width: "100%" }}
+                      >
+                        <option value="gpu">GPU Nodes Only (Fastest)</option>
+                        <option value="any">All Nodes (GPU + CPU)</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <small style={{ color: "#4ade80", fontSize: "11px", display: "block" }}>
+                    ✓ Zero JSON: Master will automatically scan node load & VRAM capacity, then balance all {autoSliceCount} slices across available workers in parallel.
+                  </small>
+                </div>
+              )}
+
+              {/* Mode 3: Manual Visual Pick (Checkboxes) */}
+              {dispatchMode === "manual" && (
+                <div style={{ background: "rgba(15, 23, 42, 0.6)", border: "1px solid #334155", borderRadius: "8px", padding: "12px 14px", marginBottom: "8px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#facc15" }}>
+                      🎛️ Select Target Workers:
+                    </span>
+                    <span style={{ fontSize: "11px", color: "#94a3b8" }}>
+                      {manualSelectedNodeIds.length} of {approvedNodes.length} selected
+                    </span>
+                  </div>
+
+                  {approvedNodes.length === 0 ? (
+                    <small className="muted" style={{ display: "block", padding: "8px 0" }}>
+                      No approved workers connected in cluster. Please connect workers first.
+                    </small>
+                  ) : (
+                    <div style={{ display: "grid", gap: "6px", maxHeight: "170px", overflowY: "auto", margin: "8px 0" }}>
+                      {approvedNodes.map((n) => {
+                        const isSelected = manualSelectedNodeIds.includes(n.id);
+                        return (
+                          <div
+                            key={n.id}
+                            onClick={() => {
+                              if (isSelected) {
+                                setManualSelectedNodeIds(manualSelectedNodeIds.filter((id) => id !== n.id));
+                              } else {
+                                setManualSelectedNodeIds([...manualSelectedNodeIds, n.id]);
+                              }
+                            }}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              padding: "8px 10px",
+                              borderRadius: "6px",
+                              border: isSelected ? "1px solid #facc15" : "1px solid #334155",
+                              background: isSelected ? "rgba(250, 204, 21, 0.08)" : "#0f172a",
+                              cursor: "pointer",
+                              transition: "all 0.15s ease"
+                            }}
+                          >
+                            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={() => {}}
+                                style={{ minHeight: "auto", cursor: "pointer" }}
+                              />
+                              <div>
+                                <strong style={{ fontSize: "12px", color: "#f1f5f9", display: "block" }}>
+                                  {n.node_name}
+                                </strong>
+                                <span style={{ fontSize: "10px", color: "#94a3b8" }}>
+                                  {n.gpu_model || "CPU Compute"} · {n.gpu_vram_bytes ? `${(n.gpu_vram_bytes / 1e9).toFixed(1)} GB VRAM` : `${n.cpu_threads || 1} Threads`}
+                                </span>
+                              </div>
+                            </div>
+                            <span className={`job-state ${n.status}`} style={{ fontSize: "10px", padding: "2px 6px" }}>
+                              {n.status}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  <small style={{ color: "#facc15", fontSize: "11px", display: "block", marginTop: "6px" }}>
+                    ✓ 1 Task will be pinned and dispatched directly to each selected worker.
+                  </small>
+                </div>
+              )}
+
+              {/* Mode 4: Advanced JSON */}
+              {dispatchMode === "advanced" && (
+                <div>
+                  <label>Scheduling Policy
+                    <select value={schedulingPolicy} onChange={(event) => setSchedulingPolicy(event.target.value as any)}>
+                      <option value="automatic">Mode A: Automatic (Dynamic based on VRAM/GPU/CPU)</option>
+                      <option value="manual">Mode B: Manual Distribution (Target specific Workers)</option>
+                      <option value="hybrid">Mode C: Hybrid (Target Workers for subset, auto-distribute rest)</option>
+                    </select>
+                  </label>
+                  {schedulingPolicy !== "automatic" && (
+                    <div className="allocation-box" style={{ margin: "8px 0" }}>
+                      <span className="eyebrow">Worker Allocation Targets</span>
+                      {approvedNodes.map((n) => (
+                        <div key={n.id} className="allocation-item">
+                          <span>{n.node_name} ({n.gpu_model || "CPU"})</span>
+                          <input
+                            type="number"
+                            min="0"
+                            placeholder="Share / %"
+                            value={allocations[n.id] ?? ""}
+                            onChange={(e) => setAllocations({ ...allocations, [n.id]: Number(e.target.value) })}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "10px 0 6px 0" }}>
+                    <span style={{ fontWeight: 600, fontSize: "12px", color: "#94a3b8" }}>Task JSON Array</span>
+                    <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                      <button type="button" onClick={() => loadPreset("ml4gpu")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#3b0764", color: "#c084fc", border: "1px solid #7e22ce", cursor: "pointer", fontWeight: 700 }}>🧪 4-Worker ML</button>
+                      <button type="button" onClick={() => loadPreset("quick5")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#38bdf8", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>⚡ 5 Math</button>
+                      <button type="button" onClick={() => loadPreset("batch20")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#4ade80", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>🚀 20 Batch</button>
+                      <button type="button" onClick={() => loadPreset("matmul")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#facc15", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>🧮 MatMul</button>
+                      <button type="button" onClick={() => setTaskJson("[]")} title="Clear JSON" style={{ fontSize: "11px", padding: "3px 6px", borderRadius: "4px", background: "#1e293b", color: "#94a3b8", border: "1px solid #334155", cursor: "pointer" }}>✕</button>
+                    </div>
+                  </div>
+                  <textarea value={taskJson} onChange={(event) => setTaskJson(event.target.value)} rows={4} style={{ fontFamily: "monospace", fontSize: "12px" }} />
+                </div>
+              )}
             </div>
-            <button className="primary-button" type="submit" style={{ marginTop: "10px" }}>Create task-parallel job</button>
+
+            <button className="primary-button" type="submit" style={{ marginTop: "6px" }}>Create task-parallel job</button>
           </form>
         </section>
       </div>
@@ -625,6 +1139,16 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                   <span className={`job-state ${job.state}`}>{job.state}</span>
+                  {job.state === "completed" && (
+                    <button
+                      type="button"
+                      title="Download combined Output Bundle (.zip)"
+                      onClick={(e) => { e.stopPropagation(); void downloadBundle(job.id); }}
+                      style={{ background: "rgba(211, 243, 107, 0.15)", border: "1px solid #d3f36b", color: "#d3f36b", cursor: "pointer", padding: "3px 8px", borderRadius: "4px", display: "inline-flex", alignItems: "center", gap: "4px", fontSize: "11px", fontWeight: 700 }}
+                    >
+                      <Download size={12} /> Output .zip
+                    </button>
+                  )}
                   <button
                     type="button"
                     title="Delete job record"
@@ -644,13 +1168,71 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
             <div className="section-heading">
               <div><span className="eyebrow">Selected job: {selectedJob?.name}</span><h2>Task detail & artifacts</h2></div>
               <div className="job-controls">
-                {selectedJob?.state === "paused" && <button className="small-button" onClick={() => void controlJob("resume")}>Resume</button>}
-                {(selectedJob?.state === "queued" || selectedJob?.state === "running") && <button className="small-button" onClick={() => void controlJob("pause")}>Pause</button>}
-                {selectedJob && !["completed", "failed", "canceled"].includes(selectedJob.state) && <button className="revoke-button" onClick={() => void controlJob("cancel")}>Cancel job</button>}
-                {selectedJob?.state === "completed" && <button className="small-button" onClick={() => void downloadResult()}><Download size={14} /> Result</button>}
-                <button className="secondary-button" onClick={() => void downloadReport("markdown")}><FileText size={14} /> Report (.md)</button>
-                <button className="secondary-button" onClick={() => void downloadReport("json")}><FileText size={14} /> Report (.json)</button>
-                <button className="revoke-button" onClick={() => void deleteJob(selectedJobId)} style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                {selectedJob?.state === "paused" && (
+                  <button className="secondary-button" style={{ display: "inline-flex", alignItems: "center", gap: "6px", whiteSpace: "nowrap" }} onClick={() => void controlJob("resume")}>
+                    Resume
+                  </button>
+                )}
+                {(selectedJob?.state === "queued" || selectedJob?.state === "running") && (
+                  <button className="secondary-button" style={{ display: "inline-flex", alignItems: "center", gap: "6px", whiteSpace: "nowrap" }} onClick={() => void controlJob("pause")}>
+                    Pause
+                  </button>
+                )}
+                {selectedJob && !["completed", "failed", "canceled"].includes(selectedJob.state) && (
+                  <button className="revoke-button" style={{ display: "inline-flex", alignItems: "center", gap: "6px", whiteSpace: "nowrap" }} onClick={() => void controlJob("cancel")}>
+                    Cancel job
+                  </button>
+                )}
+                {selectedJob?.state === "completed" && (
+                  <button
+                    className="primary-button"
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      background: "#d3f36b",
+                      color: "#0f172a",
+                      fontWeight: 700,
+                      boxShadow: "0 0 14px rgba(211,243,107,0.3)",
+                      whiteSpace: "nowrap",
+                      minHeight: "36px",
+                      padding: "8px 14px",
+                      fontSize: "12px",
+                      flexShrink: 0
+                    }}
+                    onClick={() => void downloadBundle(selectedJobId)}
+                  >
+                    <Download size={15} /> Download Output Bundle (.zip)
+                  </button>
+                )}
+                {selectedJob?.state === "completed" && (
+                  <button
+                    className="secondary-button"
+                    style={{ display: "inline-flex", alignItems: "center", gap: "6px", whiteSpace: "nowrap" }}
+                    onClick={() => void downloadResult()}
+                  >
+                    <Download size={14} /> Result (.json)
+                  </button>
+                )}
+                <button
+                  className="secondary-button"
+                  style={{ display: "inline-flex", alignItems: "center", gap: "6px", whiteSpace: "nowrap" }}
+                  onClick={() => void downloadReport("markdown")}
+                >
+                  <FileText size={14} /> Report (.md)
+                </button>
+                <button
+                  className="secondary-button"
+                  style={{ display: "inline-flex", alignItems: "center", gap: "6px", whiteSpace: "nowrap" }}
+                  onClick={() => void downloadReport("json")}
+                >
+                  <FileText size={14} /> Report (.json)
+                </button>
+                <button
+                  className="revoke-button"
+                  style={{ display: "inline-flex", alignItems: "center", gap: "6px", whiteSpace: "nowrap" }}
+                  onClick={() => void deleteJob(selectedJobId)}
+                >
                   <Trash2 size={14} /> Delete job
                 </button>
               </div>
@@ -658,14 +1240,137 @@ function WorkloadsView({ token, clusterId, nodes, workloads, jobs, onRefresh, on
             <div className="task-table">
               {tasks.map((task) => (
                 <div className="task-row" key={task.id}>
-                  <span>{task.task_key}</span>
+                  <span style={{ fontWeight: 600 }}>{task.task_key}</span>
                   <span className={`job-state ${task.state}`}>{task.state}</span>
                   <span>Att {task.attempt}</span>
-                  <span>{task.assigned_node_id ?? "Unassigned"}</span>
+                  <span title={task.assigned_node_id || undefined} style={{ display: "inline-flex", alignItems: "center", gap: "5px", overflow: "hidden" }}>
+                    <Cpu size={13} style={{ color: "#38bdf8", flexShrink: 0 }} />
+                    <strong style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#e2e8f0" }}>
+                      {task.assigned_node_name || (task.assigned_node_id ? task.assigned_node_id.slice(0, 8) : "Unassigned")}
+                    </strong>
+                  </span>
                   <span>{task.duration_seconds != null ? `${task.duration_seconds}s` : "—"}</span>
-                  <span>{task.error ?? (task.result ? JSON.stringify(task.result) : "No result")}</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", overflow: "hidden" }}>
+                    {task.state === "failed" ? (
+                      <button
+                        type="button"
+                        onClick={() => setSelectedErrorTask(task)}
+                        style={{
+                          background: "rgba(239, 68, 68, 0.15)",
+                          color: "#f87171",
+                          border: "1px solid rgba(239, 68, 68, 0.4)",
+                          borderRadius: "4px",
+                          padding: "2px 8px",
+                          fontSize: "11px",
+                          cursor: "pointer",
+                          fontWeight: 600,
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "4px",
+                          flexShrink: 0
+                        }}
+                      >
+                        ⚠️ View Error / Log
+                      </button>
+                    ) : (
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {task.result ? JSON.stringify(task.result) : "No result"}
+                      </span>
+                    )}
+                    {task.has_artifacts && (
+                      <button
+                        type="button"
+                        onClick={() => void downloadTaskArtifacts(task.id, task.task_key)}
+                        title="Download task artifact (.zip)"
+                        style={{ fontSize: "11px", padding: "2px 6px", borderRadius: "4px", background: "#1e293b", color: "#38bdf8", border: "1px solid #38bdf8", cursor: "pointer", display: "inline-flex", alignItems: "center", gap: "4px", flexShrink: 0 }}
+                      >
+                        <Download size={11} /> Artifacts (.zip)
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
+            </div>
+          </div>
+        )}
+
+        {/* Failed Task Error Modal */}
+        {selectedErrorTask && (
+          <div style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0, 0, 0, 0.75)",
+            backdropFilter: "blur(4px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1000,
+            padding: "20px"
+          }}>
+            <div style={{
+              background: "#1e293b",
+              border: "1px solid rgba(239, 68, 68, 0.4)",
+              borderRadius: "10px",
+              maxWidth: "650px",
+              width: "100%",
+              boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.5)",
+              overflow: "hidden"
+            }}>
+              <div style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                padding: "14px 18px",
+                background: "rgba(239, 68, 68, 0.1)",
+                borderBottom: "1px solid rgba(239, 68, 68, 0.2)"
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <span style={{ fontSize: "18px" }}>⚠️</span>
+                  <div>
+                    <strong style={{ color: "#f87171", fontSize: "14px", display: "block" }}>
+                      Task Failed: {selectedErrorTask.task_key}
+                    </strong>
+                    <span style={{ color: "#94a3b8", fontSize: "11px" }}>
+                      Worker: {selectedErrorTask.assigned_node_name || selectedErrorTask.assigned_node_id || "Unknown"} · Attempt #{selectedErrorTask.attempt}
+                    </span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setSelectedErrorTask(null)}
+                  style={{ background: "transparent", border: "none", color: "#cbd5e1", fontSize: "20px", cursor: "pointer", lineHeight: 1 }}
+                >
+                  ×
+                </button>
+              </div>
+              <div style={{ padding: "16px" }}>
+                <span style={{ fontSize: "12px", color: "#94a3b8", display: "block", marginBottom: "6px", fontWeight: 600 }}>
+                  Error Output & Traceback:
+                </span>
+                <pre style={{
+                  background: "#0f172a",
+                  color: "#fca5a5",
+                  padding: "12px",
+                  borderRadius: "6px",
+                  fontSize: "12px",
+                  fontFamily: "monospace",
+                  overflow: "auto",
+                  maxHeight: "300px",
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-all",
+                  border: "1px solid #334155"
+                }}>
+                  {selectedErrorTask.error || "No specific error text was returned by the worker."}
+                </pre>
+              </div>
+              <div style={{ padding: "10px 16px", background: "#0f172a", display: "flex", justifyContent: "flex-end" }}>
+                <button
+                  className="secondary-button"
+                  onClick={() => setSelectedErrorTask(null)}
+                  style={{ padding: "6px 14px", fontSize: "12px" }}
+                >
+                  Close
+                </button>
+              </div>
             </div>
           </div>
         )}
@@ -1264,6 +1969,7 @@ function Dashboard({ token, user, onLogout }: { token: string; user: User; onLog
             jobs={jobs}
             onRefresh={() => { void loadWorkloads(); }}
             onError={setError}
+            onNavigate={(v) => setView(v)}
           />
         ) : view === "worker" ? (
           <WorkerConsoleView

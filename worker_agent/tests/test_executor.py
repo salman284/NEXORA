@@ -69,3 +69,58 @@ def test_agent_cycle_executes_and_submits_result():
     agent = WorkerAgent(AgentConfig("http://master", "node-1", "token"), client)
     assert agent.run_once() is True
     assert client.submitted == ("task-1", "lease-token", {"value": 25}, None)
+
+
+def test_execute_script_and_collect_artifacts():
+    from worker_agent.agent.executor import execute_task_and_collect
+    import zipfile
+
+    script_code = """
+import pickle, json
+data = {"model_name": "ResNet18", "val_acc": 0.98}
+with open("trained_model.pkl", "wb") as f:
+    pickle.dump(data, f)
+with open("metrics.json", "w") as f:
+    json.dump(data, f)
+print("Training complete successfully")
+"""
+    payload = {
+        "operation": "execute_script",
+        "code": script_code,
+    }
+    result, artifact_zip = execute_task_and_collect(payload)
+    assert result["status"] == "succeeded"
+    assert "trained_model.pkl" in result["artifacts"]
+    assert "metrics.json" in result["artifacts"]
+    assert artifact_zip is not None and artifact_zip.is_file()
+
+    with zipfile.ZipFile(artifact_zip) as zf:
+        assert "trained_model.pkl" in zf.namelist()
+        assert "metrics.json" in zf.namelist()
+    artifact_zip.unlink(missing_ok=True)
+
+
+def test_execute_notebook_and_collect_artifacts(tmp_path):
+    from worker_agent.agent.executor import execute_task_and_collect
+    import json, zipfile
+
+    nb = {
+        "cells": [
+            {"cell_type": "code", "source": ["x = 10\n", "y = 20\n", "print(f'Sum: {x + y}')\n"]},
+            {"cell_type": "code", "source": ["with open('output_plot.png', 'wb') as f: f.write(b'PNG_DATA')\n"]}
+        ]
+    }
+    workload_zip = tmp_path / "notebook_pkg.zip"
+    with zipfile.ZipFile(workload_zip, "w") as zf:
+        zf.writestr("experiment.ipynb", json.dumps(nb))
+
+    payload = {
+        "operation": "execute_notebook",
+        "entrypoint": "experiment.ipynb"
+    }
+    result, artifact_zip = execute_task_and_collect(payload, workload_archive=workload_zip)
+    assert result["status"] == "succeeded"
+    assert "output_plot.png" in result["artifacts"]
+    assert "executed_notebook.ipynb" in result["artifacts"]
+    assert artifact_zip is not None and artifact_zip.is_file()
+    artifact_zip.unlink(missing_ok=True)

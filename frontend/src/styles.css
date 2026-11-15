@@ -54,7 +54,7 @@ textarea:focus { border-color: #b9dc62; }
 .job-state { padding: 6px 9px; border-radius: 999px; color: #d3f36b; background: #b9ee6119; font: 9px 'DM Mono', monospace; text-transform: uppercase; }
 .job-state.failed { color: #ffab9d; background: #ff8e7814; }
 .task-inspector { margin-top: 24px; }
-.job-controls { display: flex; align-items: center; gap: 8px; }
+.job-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .telemetry-panel { position: relative; min-height: 185px; margin: 28px 0 8px; padding: 20px 22px 18px; border: 1px solid #29362d; border-radius: 10px; background: #151c18; }
 .telemetry-panel h2 { font-size: 19px; }
 .telemetry-bars { display: flex; align-items: end; gap: 7px; height: 85px; margin-top: 20px; padding: 0 4px; border-bottom: 1px solid #334234; }

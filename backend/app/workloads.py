@@ -8,28 +8,32 @@ from typing import Any
 from pydantic import BaseModel, Field, model_validator
 
 
-SUPPORTED_OPERATIONS = {"identity", "square", "sum", "matmul"}
+SUPPORTED_OPERATIONS = {"identity", "square", "sum", "matmul", "execute_script", "execute_notebook", "run"}
 
 
 class WorkloadManifest(BaseModel):
     schema_version: str = Field(pattern=r"^1$")
     name: str = Field(min_length=1, max_length=160)
     description: str = Field(default="", max_length=2000)
-    runtime: str = Field(pattern=r"^builtin$")
-    backend: str = Field(default="cpu", pattern=r"^(cpu|opencl)$")
-    execution_mode: str = Field(pattern=r"^task_parallel$")
-    operation: str = Field(pattern=r"^(identity|square|sum|matmul)$")
-    aggregation: str = Field(pattern=r"^collect$")
-    output_format: str = Field(default="json", pattern=r"^json$")
+    runtime: str = Field(default="builtin", pattern=r"^(builtin|script|notebook|python)$")
+    backend: str = Field(default="cpu", pattern=r"^(cpu|opencl|cuda)$")
+    execution_mode: str = Field(default="task_parallel", pattern=r"^task_parallel$")
+    operation: str = Field(default="execute_script", max_length=64)
+    entrypoint: str = Field(default="", max_length=255)
+    aggregation: str = Field(default="collect", pattern=r"^(collect|bundle)$")
+    output_format: str = Field(default="json", max_length=32)
     required_gpu_memory_bytes: int = Field(default=0, ge=0)
     required_cpu_threads: int = Field(default=1, ge=1, le=4096)
     required_ram_bytes: int = Field(default=0, ge=0)
     dependencies: list[str] = Field(default_factory=list, max_length=50)
 
     @model_validator(mode="after")
-    def reject_dependencies(self) -> "WorkloadManifest":
-        if self.dependencies:
-            raise ValueError("Dependency installation is not supported by the built-in adapter")
+    def validate_runtime_and_deps(self) -> "WorkloadManifest":
+        if self.runtime == "builtin":
+            if self.operation not in {"identity", "square", "sum", "matmul"}:
+                raise ValueError("Built-in runtime only supports identity, square, sum, matmul")
+            if self.dependencies:
+                raise ValueError("Dependency installation is not supported by the built-in adapter")
         return self
 
 

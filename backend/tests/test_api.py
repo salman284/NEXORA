@@ -582,6 +582,37 @@ def test_manual_and_hybrid_scheduling_and_job_reports(client: TestClient):
     assert "NEXORA Job Execution Report" in report_md.text
     assert "Node Contribution Summary" in report_md.text
 
+    # Upload task artifacts from worker 1
+    art_zip_buf = io.BytesIO()
+    with zipfile.ZipFile(art_zip_buf, "w") as zf:
+        zf.writestr("model_fold1.pkl", b"dummy_model_bytes")
+        zf.writestr("metrics.json", b'{"accuracy": 0.95}')
+    art_bytes = art_zip_buf.getvalue()
+
+    art_upload = client.post(
+        f"/api/v1/worker/tasks/{lease1.json()['task']['id']}/artifacts",
+        headers=w1_headers,
+        files={"file": ("artifacts.zip", io.BytesIO(art_bytes), "application/zip")},
+    )
+    assert art_upload.status_code == 200
+
+    # Test downloading single task artifact
+    single_art_res = client.get(
+        f"/api/v1/tasks/{lease1.json()['task']['id']}/artifacts",
+        headers=master_headers,
+    )
+    assert single_art_res.status_code == 200
+    assert "artifacts.zip" in single_art_res.headers.get("content-disposition", "")
+
+    # Test downloading consolidated multi-worker job bundle (.zip)
+    bundle_res = client.get(f"/api/v1/jobs/{job['id']}/bundle", headers=master_headers)
+    assert bundle_res.status_code == 200
+    assert "bundle.zip" in bundle_res.headers.get("content-disposition", "")
+    with zipfile.ZipFile(io.BytesIO(bundle_res.content)) as b_zf:
+        names = b_zf.namelist()
+        assert "consolidated_summary.json" in names
+        assert any("model_fold1.pkl" in n for n in names)
+
     # Drain worker node
     drain_res = client.post(f"/api/v1/worker/nodes/{node1['id']}/drain", headers=w1_headers)
     assert drain_res.status_code == 200

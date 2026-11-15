@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from __future__ import annotations
 import hashlib
 import hmac
+import io
 import json
 import os
 import secrets
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -251,11 +254,13 @@ class JobResponse(BaseModel):
 class TaskResponse(BaseModel):
     id: str
     job_id: str
+    workload_id: str | None = None
     task_key: str
     payload: dict[str, Any]
     state: str
     attempt: int
     assigned_node_id: str | None
+    assigned_node_name: str | None = None
     pinned_node_id: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -265,6 +270,8 @@ class TaskResponse(BaseModel):
     result: dict[str, Any] | None
     result_hash: str | None
     error: str | None
+    has_artifacts: bool = False
+    artifact_size_bytes: int | None = None
 
 
 class TaskReportItem(BaseModel):
@@ -373,6 +380,10 @@ def workload_storage_path() -> Path:
     return Path(os.getenv("NEXORA_WORKLOAD_STORAGE", "backend/data/workloads"))
 
 
+def artifact_storage_path() -> Path:
+    return Path(os.getenv("NEXORA_ARTIFACT_STORAGE", "backend/data/artifacts"))
+
+
 def _parse_dt(value) -> datetime | None:
     if value is None:
         return None
@@ -411,15 +422,17 @@ def node_response(node_doc: dict, membership_status: str, tasks_completed: int =
     )
 
 
-def task_response(doc: dict) -> TaskResponse:
+def task_response(doc: dict, workload_id: str | None = None, node_name: str | None = None) -> TaskResponse:
     return TaskResponse(
         id=doc["task_id"],
         job_id=doc["job_id"],
+        workload_id=workload_id or doc.get("workload_id"),
         task_key=doc["task_key"],
         payload=json.loads(doc["payload_json"]),
         state=doc["state"],
         attempt=doc.get("attempt", 0),
         assigned_node_id=doc.get("assigned_node_id"),
+        assigned_node_name=node_name or doc.get("assigned_node_name"),
         pinned_node_id=doc.get("pinned_node_id"),
         started_at=_parse_dt(doc.get("started_at")),
         completed_at=_parse_dt(doc.get("completed_at")),
@@ -429,6 +442,8 @@ def task_response(doc: dict) -> TaskResponse:
         result=json.loads(doc["result_json"]) if doc.get("result_json") else None,
         result_hash=doc.get("result_hash"),
         error=doc.get("error"),
+        has_artifacts=bool(doc.get("has_artifacts")),
+        artifact_size_bytes=doc.get("artifact_size_bytes"),
     )
 
 
@@ -1056,8 +1071,10 @@ def create_job(payload: JobCreateRequest, user: CurrentUser) -> JobResponse:
             mismatched_tasks = [
                 task.task_key
                 for task in payload.tasks
-                if task.payload.get("operation") != manifest.operation
-                or task.payload.get("backend", "cpu") != manifest.backend
+                if manifest.runtime == "builtin" and (
+                    task.payload.get("operation") != manifest.operation
+                    or task.payload.get("backend", "cpu") != manifest.backend
+                )
             ]
             if mismatched_tasks:
                 raise HTTPException(status_code=400, detail=f"Tasks do not match workload operation: {mismatched_tasks}")
@@ -1106,6 +1123,7 @@ def create_job(payload: JobCreateRequest, user: CurrentUser) -> JobResponse:
             {
                 "task_id": str(uuid.uuid4()),
                 "job_id": job_id,
+                "workload_id": payload.workload_id,
                 "task_key": task.task_key,
                 "payload_json": canonical_json(task.payload),
                 "payload_hash": json_hash(task.payload),
@@ -1155,7 +1173,13 @@ def list_tasks(job_id: str, user: CurrentUser) -> list[TaskResponse]:
     with connection_scope() as db:
         require_master_job(db, job_id, user)
         docs = list(db.tasks.find({"job_id": job_id}).sort("task_key", 1))
-    return [task_response(d) for d in docs]
+        node_ids = {d.get("assigned_node_id") for d in docs if d.get("assigned_node_id")}
+        node_map: dict[str, str] = {}
+        if node_ids:
+            for n in db.nodes.find({"node_id": {"$in": list(node_ids)}}):
+                if n.get("node_id") and n.get("node_name"):
+                    node_map[n["node_id"]] = n["node_name"]
+        return [task_response(d, node_name=node_map.get(d.get("assigned_node_id"))) for d in docs]
 
 
 @app.get("/api/v1/jobs/{job_id}/result", response_model=FinalResultResponse)
@@ -1439,6 +1463,7 @@ def lease_task(node_id: str, user: CurrentUser) -> TaskLeaseResponse | None:
                 "state": "leased",
                 "attempt": attempt,
                 "assigned_node_id": node_id,
+                "assigned_node_name": node_doc.get("node_name"),
                 "lease_token_hash": hash_token(lease_token),
                 "lease_expires_at": lease_expires_at,
                 "next_retry_at": None,
@@ -1448,7 +1473,7 @@ def lease_task(node_id: str, user: CurrentUser) -> TaskLeaseResponse | None:
         )
         db.jobs.update_one({"job_id": selected["job_id"]}, {"$set": {"state": "running", "updated_at": now}})
         leased_doc = db.tasks.find_one({"task_id": selected["task_id"]})
-    return TaskLeaseResponse(lease_token=lease_token, task=task_response(leased_doc))
+    return TaskLeaseResponse(lease_token=lease_token, task=task_response(leased_doc, workload_id=selected["job"].get("workload_id")))
 
 
 @app.post("/api/v1/worker/tasks/{task_id}/result", response_model=TaskResponse)
@@ -1534,7 +1559,16 @@ async def upload_workload(
         data = await file.read(MAX_WORKLOAD_BYTES + 1)
         if len(data) > MAX_WORKLOAD_BYTES:
             raise ValueError(f"Workload exceeds the {MAX_WORKLOAD_BYTES} byte limit")
-        validate_archive(data, file.filename)
+        
+        filename = file.filename
+        if filename.lower().endswith((".py", ".ipynb")):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(filename, data)
+            data = buf.getvalue()
+            filename = f"{Path(filename).stem}.zip"
+        
+        validate_archive(data, filename)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -1568,6 +1602,137 @@ def list_workloads(user: CurrentUser) -> list[WorkloadResponse]:
     with connection_scope() as db:
         docs = list(db.workloads.find({"owner_id": user.id}).sort("created_at", -1))
     return [workload_response(d) for d in docs]
+
+
+@app.get("/api/v1/worker/workloads/{workload_id}/download")
+def download_workload_package(workload_id: str, user: CurrentUser) -> FileResponse:
+    with connection_scope() as db:
+        doc = db.workloads.find_one({"workload_id": workload_id})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Workload not found")
+        path = Path(doc["storage_path"])
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Workload file not found on disk")
+        return FileResponse(path, media_type="application/zip", filename=f"{workload_id}.zip")
+
+
+@app.post("/api/v1/worker/tasks/{task_id}/artifacts")
+async def upload_task_artifacts(
+    task_id: str,
+    file: Annotated[UploadFile, File()],
+    user: CurrentUser,
+) -> dict[str, Any]:
+    with connection_scope() as db:
+        task = db.tasks.find_one({"task_id": task_id})
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        job_id = task["job_id"]
+        task_key = task["task_key"]
+
+        data = await file.read(500 * 1024 * 1024 + 1)
+        if len(data) > 500 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Artifact archive exceeds 500 MB limit")
+
+        artifact_dir = artifact_storage_path() / job_id
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_file = artifact_dir / f"{task_key}.zip"
+        artifact_file.write_bytes(data)
+
+        db.tasks.update_one(
+            {"task_id": task_id},
+            {"$set": {
+                "has_artifacts": True,
+                "artifact_path": str(artifact_file),
+                "artifact_size_bytes": len(data),
+                "updated_at": utc_now(),
+            }},
+        )
+        record_audit(db, user.id, "task.artifacts_uploaded", "task", task_id, "success", {"size_bytes": len(data)})
+    return {"message": "Artifacts stored successfully", "task_id": task_id, "size_bytes": len(data)}
+
+
+@app.get("/api/v1/jobs/{job_id}/bundle")
+def download_job_bundle(job_id: str, user: CurrentUser) -> FileResponse:
+    with connection_scope() as db:
+        job_doc = require_master_job(db, job_id, user)
+        tasks_docs = list(db.tasks.find({"job_id": job_id}).sort("task_key", 1))
+
+        bundle_dir = artifact_storage_path() / job_id
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        bundle_zip_path = bundle_dir / "final_output_bundle.zip"
+
+        node_name_map = {}
+        for td in tasks_docs:
+            nid = td.get("assigned_node_id")
+            if nid and nid not in node_name_map:
+                n = db.nodes.find_one({"node_id": nid}, {"node_name": 1})
+                node_name_map[nid] = n["node_name"] if n else "Unknown"
+
+        with zipfile.ZipFile(bundle_zip_path, "w", zipfile.ZIP_DEFLATED) as master_zf:
+            summary_data = {
+                "job_id": job_id,
+                "job_name": job_doc["name"],
+                "state": job_doc["state"],
+                "total_tasks": len(tasks_docs),
+                "succeeded_tasks": sum(1 for t in tasks_docs if t["state"] == "succeeded"),
+                "created_at": _parse_dt(job_doc["created_at"]).isoformat() if _parse_dt(job_doc["created_at"]) else None,
+                "updated_at": _parse_dt(job_doc["updated_at"]).isoformat() if _parse_dt(job_doc["updated_at"]) else None,
+                "tasks": [
+                    {
+                        "task_key": t["task_key"],
+                        "assigned_node": node_name_map.get(t.get("assigned_node_id"), "unassigned"),
+                        "state": t["state"],
+                        "duration_seconds": t.get("duration_seconds"),
+                        "has_artifacts": bool(t.get("has_artifacts")),
+                        "result": json.loads(t["result_json"]) if t.get("result_json") else None,
+                        "error": t.get("error"),
+                    }
+                    for t in tasks_docs
+                ],
+            }
+            master_zf.writestr("consolidated_summary.json", json.dumps(summary_data, indent=2))
+
+            for td in tasks_docs:
+                art_path_str = td.get("artifact_path")
+                t_key = td["task_key"]
+                raw_node = node_name_map.get(td.get("assigned_node_id"), "worker")
+                safe_node = "".join(c if c.isalnum() else "_" for c in raw_node).strip("_")
+                subfolder = f"{t_key}_{safe_node}"
+
+                if art_path_str and Path(art_path_str).is_file():
+                    try:
+                        with zipfile.ZipFile(art_path_str, "r") as task_zf:
+                            for member_name in task_zf.namelist():
+                                if not member_name.endswith("/"):
+                                    member_bytes = task_zf.read(member_name)
+                                    master_zf.writestr(f"{subfolder}/{member_name}", member_bytes)
+                    except Exception:
+                        pass
+                elif td.get("result_json"):
+                    master_zf.writestr(f"{subfolder}/result.json", td["result_json"])
+
+        slug = "".join(c if c.isalnum() else "_" for c in job_doc["name"]).strip("_") or "job"
+        return FileResponse(
+            bundle_zip_path,
+            media_type="application/zip",
+            filename=f"nexora-{slug}-{job_id[:8]}-bundle.zip",
+        )
+
+
+@app.get("/api/v1/tasks/{task_id}/artifacts")
+def download_task_artifacts(task_id: str, user: CurrentUser) -> FileResponse:
+    with connection_scope() as db:
+        task = db.tasks.find_one({"task_id": task_id})
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        art_path = task.get("artifact_path")
+        if not art_path or not Path(art_path).is_file():
+            raise HTTPException(status_code=404, detail="No artifacts found for this task")
+        return FileResponse(
+            Path(art_path),
+            media_type="application/zip",
+            filename=f"nexora-task-{task['task_key']}-artifacts.zip",
+        )
 
 
 # ---------------------------------------------------------------------------

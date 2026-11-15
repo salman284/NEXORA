@@ -29,8 +29,10 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 try:
+    from worker_agent.agent.executor import execute_task_and_collect as run_task_engine
     from worker_agent.agent.executor import execute_task_with_backend as run_task
 except ImportError:
+    run_task_engine = None
     # Standalone fallback if packaged outside repo
     def run_task(payload: dict[str, Any]) -> dict[str, Any]:
         op = payload.get("operation")
@@ -428,8 +430,39 @@ class NexoraWorkerApp(tk.Tk):
                     # Execute task
                     t0 = time.time()
                     try:
-                        res = run_task(task["payload"])
+                        workload_id = task.get("workload_id")
+                        workload_zip_path = None
+                        if workload_id:
+                            cache_dir = Path(tempfile.gettempdir()) / "nexora_worker_workloads"
+                            cache_dir.mkdir(parents=True, exist_ok=True)
+                            cached_file = cache_dir / f"{workload_id}.zip"
+                            if not cached_file.is_file():
+                                self.log(f"📥 Downloading workload package {workload_id[:8]}...")
+                                dl_resp = session.get(f"{master_url}/api/v1/worker/workloads/{workload_id}/download", timeout=30)
+                                if dl_resp.status_code == 200:
+                                    cached_file.write_bytes(dl_resp.content)
+                                    workload_zip_path = cached_file
+                            else:
+                                workload_zip_path = cached_file
+
+                        if run_task_engine:
+                            res, artifact_zip_path = run_task_engine(task["payload"], workload_archive=workload_zip_path)
+                        else:
+                            res = run_task(task["payload"])
+                            artifact_zip_path = None
+
                         dur = round(time.time() - t0, 3)
+
+                        if artifact_zip_path and os.path.isfile(artifact_zip_path):
+                            art_count = res.get("artifact_count", 0)
+                            self.log(f"📦 Uploading {art_count} output artifact(s) to master...")
+                            with open(artifact_zip_path, "rb") as f:
+                                session.post(
+                                    f"{master_url}/api/v1/worker/tasks/{task_id}/artifacts",
+                                    files={"file": (f"{task_key}.zip", f, "application/zip")},
+                                    timeout=60,
+                                )
+
                         # Submit success
                         sub = session.post(
                             f"{master_url}/api/v1/worker/tasks/{task_id}/result",
@@ -437,7 +470,8 @@ class NexoraWorkerApp(tk.Tk):
                             timeout=6,
                         )
                         if sub.status_code == 200:
-                            self.log(f"✅ Task '{task_key}' succeeded in {dur}s! Result sent to master.")
+                            art_info = f" with {res.get('artifact_count')} artifact(s)" if res.get('artifact_count') else ""
+                            self.log(f"✅ Task '{task_key}' succeeded in {dur}s{art_info}! Synced with master.")
                         else:
                             self.log(f"Result submission error: {sub.text}")
                     except Exception as exec_err:
