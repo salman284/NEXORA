@@ -22,10 +22,13 @@ logger = logging.getLogger("nexora.db")
 # Config
 # ---------------------------------------------------------------------------
 def get_mongodb_uri() -> str:
-    return os.getenv(
-        "MONGODB_URI",
-        "mongodb+srv://pizzadelivery:Salman%4061188914@nexora.h005atk.mongodb.net/?retryWrites=true&w=majority",
-    )
+    uri = os.getenv("MONGODB_URI")
+    if not uri:
+        raise RuntimeError(
+            "MONGODB_URI environment variable is not set. "
+            "Copy .env.example to .env and fill in your MongoDB URI."
+        )
+    return uri
 
 
 def get_db_name() -> str:
