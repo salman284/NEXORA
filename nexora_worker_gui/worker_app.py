@@ -1,15 +1,16 @@
 """
-NEXORA - Desktop Worker GUI Application v2
-Enhanced features:
-  - Persistent settings (save/load config)
-  - Live CPU / RAM / GPU resource gauges
-  - Session task stats (completed, failed, compute time)
-  - Current task display with live elapsed timer
-  - Auto-reconnect on connection drop (up to 5 retries)
-  - System tray minimize (requires pystray + Pillow)
-  - Desktop notifications (requires plyer)
-  - Log filtering (All / Errors / Tasks) + Clear + Export
-  - Collapsible connection config card
+NEXORA - Desktop Worker GUI Application v2.1
+Features:
+  - Custom Branded AI Node Identity & Embedded Logo
+  - Persistent Settings (save/load ~/.nexora_worker/config.json)
+  - Real-Time Hardware Resource Gauges (CPU, RAM, GPU)
+  - Live Compute Telemetry & Session Workload Metrics
+  - Active Task Tracker with Sub-Second Elapsed Timer
+  - Fault-Tolerant Auto-Reconnect Protocol (Exponential Backoff)
+  - Windows System Tray Integration with Live Status Dot
+  - Desktop Toast Notifications (Approval, Completion, Disconnect)
+  - Filterable Telemetry Stream (All / Tasks / Errors) + Export
+  - Collapsible Connection Drawer & Responsive Full-Screen Layout
 """
 
 from __future__ import annotations
@@ -47,10 +48,28 @@ try:
 except ImportError:
     HAS_NOTIFY = False
 
-# ── Project path ───────────────────────────────────────────────────────────
+# ── Project Path & Assets Helper ──────────────────────────────────────────
 project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+
+
+def get_asset_path(filename: str) -> Path:
+    """Resolve asset path safely both in development and PyInstaller bundle."""
+    if hasattr(sys, "_MEIPASS"):
+        # PyInstaller temp folder
+        p = Path(sys._MEIPASS) / "assets" / filename
+        if p.exists():
+            return p
+        p_root = Path(sys._MEIPASS) / filename
+        if p_root.exists():
+            return p_root
+    # Development mode
+    local_asset = Path(__file__).resolve().parent / "assets" / filename
+    if local_asset.exists():
+        return local_asset
+    return Path(__file__).resolve().parent / filename
+
 
 try:
     from worker_agent.agent.executor import execute_task_and_collect as run_task_engine
@@ -85,21 +104,24 @@ except ImportError:
 
 logger = logging.getLogger("nexora.worker")
 
-# ── Colour palette ─────────────────────────────────────────────────────────
-C_BG     = "#0f172a"
-C_CARD   = "#1e293b"
-C_BORDER = "#334155"
-C_TEXT   = "#f8fafc"
-C_SUB    = "#94a3b8"
-C_BLUE   = "#38bdf8"
-C_GREEN  = "#22c55e"
-C_LIME   = "#4ade80"
-C_YELLOW = "#f59e0b"
-C_RED    = "#ef4444"
-C_PURPLE = "#a855f7"
+# ── Color Palette (NEXORA Cyberpunk Dark) ──────────────────────────────────
+C_BG          = "#070b14"   # Deep void navy background
+C_CARD        = "#0f172a"   # Sleek glass navy card
+C_CARD_ALT    = "#131d33"   # Subtle secondary card
+C_BORDER      = "#1e293b"   # Border slate
+C_BORDER_HI   = "#334155"   # Border highlight
+C_TEXT        = "#f8fafc"   # Primary text
+C_SUB         = "#94a3b8"   # Muted subtext
+C_BLUE        = "#38bdf8"   # Electric neon cyan
+C_CYAN_GLOW   = "#0284c7"   # Button cyan
+C_GREEN       = "#22c55e"   # Online green
+C_LIME        = "#a3e635"   # Accent lime
+C_YELLOW      = "#f59e0b"   # Warning amber
+C_RED         = "#f43f5e"   # Danger rose/crimson
+C_PURPLE      = "#c084fc"   # Quantum purple
 
 
-# ── Config persistence ─────────────────────────────────────────────────────
+# ── Config Persistence ─────────────────────────────────────────────────────
 CONFIG_PATH = Path.home() / ".nexora_worker" / "config.json"
 
 
@@ -117,7 +139,7 @@ def save_config(data: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-# ── Hardware detection ─────────────────────────────────────────────────────
+# ── Hardware Detection ─────────────────────────────────────────────────────
 def detect_hardware() -> dict[str, Any]:
     info: dict[str, Any] = {
         "hostname":     socket.gethostname(),
@@ -154,27 +176,27 @@ def detect_hardware() -> dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Main Application
+#  Main Application Window
 # ══════════════════════════════════════════════════════════════════════════════
 class NexoraWorkerApp(tk.Tk):
-    # ── Init ──────────────────────────────────────────────────────────────────
     def __init__(self):
         super().__init__()
-        self.title("NEXORA — Worker Agent")
-        self.geometry("860x820")
-        self.minsize(740, 660)
+        self.title("NEXORA — Distributed Cluster Worker")
+        self.geometry("900x840")
+        self.minsize(760, 680)
         self.configure(bg=C_BG)
 
+        self._load_app_icons()
         self.hardware    = detect_hardware()
         self.config_data = load_config()
 
         # Worker state
-        self.is_running: bool                   = False
+        self.is_running: bool                          = False
         self.worker_thread: Optional[threading.Thread] = None
-        self._tray_icon: Optional[Any]          = None
-        self._conn_card_visible: bool           = True
+        self._tray_icon: Optional[Any]                 = None
+        self._conn_card_visible: bool                  = True
 
-        # Task tracking
+        # Task metrics
         self._tasks_completed:   int   = 0
         self._tasks_failed:      int   = 0
         self._total_compute_sec: float = 0.0
@@ -182,8 +204,8 @@ class NexoraWorkerApp(tk.Tk):
         self._task_start:        float          = 0.0
         self._session_start:     float          = time.time()
 
-        # Log
-        self._log_entries: list[tuple[str, str, str]] = []  # (hh:mm:ss, level, text)
+        # Live log
+        self._log_entries: list[tuple[str, str, str]] = []  # (ts, level, text)
         self._log_filter   = tk.StringVar(value="all")
 
         self._apply_styles()
@@ -194,34 +216,46 @@ class NexoraWorkerApp(tk.Tk):
             self._setup_tray()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # ── App Icons ─────────────────────────────────────────────────────────────
+    def _load_app_icons(self):
+        ico_file = get_asset_path("worker_icon.ico")
+        if ico_file.is_file():
+            try:
+                self.iconbitmap(str(ico_file))
+            except Exception:
+                pass
+        png_file = get_asset_path("worker_icon_64.png")
+        if png_file.is_file():
+            try:
+                self._icon_photo = tk.PhotoImage(file=str(png_file))
+                self.iconphoto(True, self._icon_photo)
+            except Exception:
+                pass
+
     # ── Styles ────────────────────────────────────────────────────────────────
     def _apply_styles(self):
         s = ttk.Style(self)
         s.theme_use("clam")
         s.configure(".", background=C_BG, foreground=C_TEXT, font=("Segoe UI", 10))
 
-        s.configure("H.TLabel",    font=("Segoe UI", 16, "bold"), foreground=C_BLUE,  background=C_BG)
-        s.configure("Sub.TLabel",  font=("Segoe UI", 9),          foreground=C_SUB,   background=C_BG)
-        s.configure("Sec.TLabel",  font=("Segoe UI", 8, "bold"),  foreground=C_SUB,   background=C_CARD)
-        s.configure("Card.TFrame", background=C_CARD, relief="flat")
-        s.configure("KV.TLabel",   background=C_CARD, foreground=C_SUB,  font=("Segoe UI", 9))
-        s.configure("VV.TLabel",   background=C_CARD, foreground=C_BLUE, font=("Segoe UI", 9, "bold"))
+        s.configure("Primary.TButton", background=C_CYAN_GLOW, foreground="#ffffff",
+                    font=("Segoe UI", 10, "bold"), borderwidth=0, padding=8)
+        s.map("Primary.TButton", background=[("active", "#0369a1"), ("disabled", "#334155")])
 
-        s.configure("Primary.TButton",   background="#0284c7", foreground="#fff", font=("Segoe UI", 10, "bold"), borderwidth=0, padding=8)
-        s.configure("Danger.TButton",    background="#dc2626", foreground="#fff", font=("Segoe UI", 10, "bold"), borderwidth=0, padding=8)
-        s.configure("Secondary.TButton", background=C_BORDER,  foreground=C_TEXT, font=("Segoe UI", 9),          borderwidth=0, padding=6)
+        s.configure("Danger.TButton", background="#be123c", foreground="#ffffff",
+                    font=("Segoe UI", 10, "bold"), borderwidth=0, padding=8)
+        s.map("Danger.TButton", background=[("active", "#9f1239"), ("disabled", "#334155")])
 
-        s.map("Primary.TButton",   background=[("active", "#0369a1"), ("disabled", "#475569")])
-        s.map("Danger.TButton",    background=[("active", "#b91c1c"), ("disabled", "#475569")])
-        s.map("Secondary.TButton", background=[("active", "#475569"), ("disabled", C_CARD)])
+        s.configure("Secondary.TButton", background=C_BORDER, foreground=C_TEXT,
+                    font=("Segoe UI", 9), borderwidth=0, padding=6)
+        s.map("Secondary.TButton", background=[("active", C_BORDER_HI), ("disabled", C_CARD)])
 
         s.configure("CPU.Horizontal.TProgressbar", troughcolor=C_BORDER, background=C_BLUE,   borderwidth=0, thickness=10)
         s.configure("RAM.Horizontal.TProgressbar", troughcolor=C_BORDER, background=C_GREEN,  borderwidth=0, thickness=10)
         s.configure("GPU.Horizontal.TProgressbar", troughcolor=C_BORDER, background=C_PURPLE, borderwidth=0, thickness=10)
 
-    # ── UI build ──────────────────────────────────────────────────────────────
+    # ── UI Construction ───────────────────────────────────────────────────────
     def _build_ui(self):
-        # Outer scrollable canvas
         outer = tk.Frame(self, bg=C_BG)
         outer.pack(fill=tk.BOTH, expand=True)
 
@@ -235,7 +269,6 @@ class NexoraWorkerApp(tk.Tk):
         )
         win_id = canvas.create_window((0, 0), window=self._scroll_frame, anchor="nw")
 
-        # KEY FIX: make scroll_frame always fill the canvas width and expand height in fullscreen
         def _on_canvas_configure(e):
             try:
                 req_h = self._scroll_frame.winfo_reqheight()
@@ -244,7 +277,6 @@ class NexoraWorkerApp(tk.Tk):
                 canvas.itemconfig(win_id, width=e.width)
 
         canvas.bind("<Configure>", _on_canvas_configure)
-
         canvas.configure(yscrollcommand=sb.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -252,45 +284,78 @@ class NexoraWorkerApp(tk.Tk):
 
         mf = self._scroll_frame
 
-        # ── 1. Header ─────────────────────────────────────────────────────
-        hdr = tk.Frame(mf, bg=C_BG)
-        hdr.pack(fill=tk.X, padx=16, pady=(14, 10))
-        tk.Label(hdr, text="⚡ NEXORA Distributed Worker",
-                 font=("Segoe UI", 16, "bold"), fg=C_BLUE, bg=C_BG).pack(anchor=tk.W)
-        tk.Label(hdr, text="Connect your CPU/GPU hardware to the distributed cluster with 1 click.",
-                 font=("Segoe UI", 9), fg=C_SUB, bg=C_BG).pack(anchor=tk.W)
+        # ── 1. Branded Header with Logo ───────────────────────────────────
+        self._build_header(mf)
 
         # ── 2. Hardware + Live Gauges (side by side) ───────────────────────
         row2 = tk.Frame(mf, bg=C_BG)
-        row2.pack(fill=tk.X, padx=16, pady=(0, 8))
+        row2.pack(fill=tk.X, padx=16, pady=(0, 10))
         row2.columnconfigure(0, weight=1)
         row2.columnconfigure(1, weight=1)
         self._build_hardware_card(row2)
         self._build_gauge_card(row2)
 
-        # ── 3. Session Stats ───────────────────────────────────────────────
+        # ── 3. Session Workload Metrics ───────────────────────────────────
         self._build_stats_card(mf)
 
-        # ── 4. Current Task ────────────────────────────────────────────────
+        # ── 4. Active Task Card ───────────────────────────────────────────
         self._build_task_card(mf)
 
-        # ── 5. Connection Config ───────────────────────────────────────────
+        # ── 5. Connection Drawer ──────────────────────────────────────────
         self._build_conn_card(mf)
 
-        # ── 6. Buttons ────────────────────────────────────────────────────
+        # ── 6. Control Action Buttons ─────────────────────────────────────
         self._build_buttons(mf)
 
-        # ── 7. Log section ─────────────────────────────────────────────────
+        # ── 7. Real-Time Telemetry Log ────────────────────────────────────
         self._build_log_section(mf)
 
-    # ── Hardware card ─────────────────────────────────────────────────────────
+    # ── Header with Logo ──────────────────────────────────────────────────────
+    def _build_header(self, parent):
+        hdr = tk.Frame(parent, bg=C_BG)
+        hdr.pack(fill=tk.X, padx=16, pady=(16, 12))
+
+        # Brand Info (Left)
+        brand_left = tk.Frame(hdr, bg=C_BG)
+        brand_left.pack(side=tk.LEFT, fill=tk.Y)
+
+        logo_path = get_asset_path("worker_icon_64.png")
+        if logo_path.is_file():
+            try:
+                self._header_logo = tk.PhotoImage(file=str(logo_path))
+                logo_lbl = tk.Label(brand_left, image=self._header_logo, bg=C_BG, bd=0)
+                logo_lbl.pack(side=tk.LEFT, padx=(0, 12))
+            except Exception:
+                pass
+
+        title_box = tk.Frame(brand_left, bg=C_BG)
+        title_box.pack(side=tk.LEFT, fill=tk.Y)
+
+        tk.Label(
+            title_box, text="NEXORA CLUSTER NODE",
+            font=("Segoe UI", 16, "bold"), fg="#ffffff", bg=C_BG
+        ).pack(anchor=tk.W)
+        tk.Label(
+            title_box, text="Decentralized GPU & CPU Compute Worker • v2.1",
+            font=("Segoe UI", 9), fg=C_BLUE, bg=C_BG
+        ).pack(anchor=tk.W)
+
+        # Status Badge (Right)
+        self.status_pill = tk.Label(
+            hdr, text="● OFFLINE", font=("Segoe UI", 9, "bold"),
+            fg=C_RED, bg=C_CARD, padx=14, pady=6, relief="solid", bd=1,
+            highlightbackground=C_BORDER
+        )
+        self.status_pill.pack(side=tk.RIGHT, pady=4)
+
+    # ── Hardware Card ─────────────────────────────────────────────────────────
     def _build_hardware_card(self, parent):
-        card = tk.Frame(parent, bg=C_CARD)
-        card.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        card = tk.Frame(parent, bg=C_CARD, highlightthickness=1, highlightbackground=C_BORDER)
+        card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         self._add_padding(card)
 
         tk.Label(card, text="💻  DETECTED HARDWARE", font=("Segoe UI", 8, "bold"),
-                 fg=C_SUB, bg=C_CARD).pack(anchor=tk.W, pady=(0, 8))
+                 fg=C_BLUE, bg=C_CARD).pack(anchor=tk.W, pady=(0, 8))
 
         has_gpu = self.hardware["gpu_vram_gb"] > 0
         rows = [
@@ -308,37 +373,36 @@ class NexoraWorkerApp(tk.Tk):
             tk.Label(r, text=f"{lbl}:", width=4, anchor=tk.W,
                      font=("Segoe UI", 9), fg=C_SUB, bg=C_CARD).pack(side=tk.LEFT)
             tk.Label(r, text=val, font=("Segoe UI", 9, "bold"),
-                     fg=color, bg=C_CARD, wraplength=600, anchor=tk.W).pack(side=tk.LEFT, padx=(4, 0))
+                     fg=color, bg=C_CARD, wraplength=480, anchor=tk.W).pack(side=tk.LEFT, padx=(4, 0))
 
-    # ── Gauge card ────────────────────────────────────────────────────────────
+    # ── Gauge Card ────────────────────────────────────────────────────────────
     def _build_gauge_card(self, parent):
-        card = tk.Frame(parent, bg=C_CARD)
-        card.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        card = tk.Frame(parent, bg=C_CARD, highlightthickness=1, highlightbackground=C_BORDER)
+        card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         self._add_padding(card)
 
-        tk.Label(card, text="📊  LIVE RESOURCE USAGE", font=("Segoe UI", 8, "bold"),
-                 fg=C_SUB, bg=C_CARD).pack(anchor=tk.W, pady=(0, 8))
+        tk.Label(card, text="⚡  LIVE PERFORMANCE", font=("Segoe UI", 8, "bold"),
+                 fg=C_BLUE, bg=C_CARD).pack(anchor=tk.W, pady=(0, 8))
 
-        self.cpu_bar  = self._gauge_row(card, "CPU ", "CPU.Horizontal.TProgressbar")
-        self.ram_bar  = self._gauge_row(card, "RAM ", "RAM.Horizontal.TProgressbar")
+        self.cpu_bar = self._gauge_row(card, "CPU", "CPU.Horizontal.TProgressbar")
+        self.ram_bar = self._gauge_row(card, "RAM", "RAM.Horizontal.TProgressbar")
 
         has_gpu = self.hardware["gpu_vram_gb"] > 0
         if has_gpu:
-            self.gpu_bar = self._gauge_row(card, "GPU ", "GPU.Horizontal.TProgressbar")
+            self.gpu_bar = self._gauge_row(card, "GPU", "GPU.Horizontal.TProgressbar")
         else:
             self.gpu_bar = None
-            tk.Label(card, text="GPU: Not detected (CPU compute)",
-                     font=("Segoe UI", 8), fg=C_SUB, bg=C_CARD).pack(anchor=tk.W, pady=4)
+            tk.Label(card, text="GPU: Not detected (CPU compute mode)",
+                     font=("Segoe UI", 8), fg=C_SUB, bg=C_CARD).pack(anchor=tk.W, pady=3)
 
-        self.uptime_lbl = tk.Label(card, text="Session: 00:00:00",
+        self.uptime_lbl = tk.Label(card, text="Session Uptime: 00:00:00",
                                    font=("Segoe UI", 8), fg=C_SUB, bg=C_CARD)
-        self.uptime_lbl.pack(anchor=tk.W, pady=(10, 0))
+        self.uptime_lbl.pack(anchor=tk.W, pady=(8, 0))
 
     def _gauge_row(self, parent, label: str, style: str):
-        """Create a labelled progress-bar row; bar fills available width."""
         row = tk.Frame(parent, bg=C_CARD)
-        row.pack(fill=tk.X, pady=4)
-        row.columnconfigure(1, weight=1)   # bar column stretches
+        row.pack(fill=tk.X, pady=3)
+        row.columnconfigure(1, weight=1)
 
         tk.Label(row, text=label, width=4, font=("Segoe UI", 9),
                  fg=C_SUB, bg=C_CARD).grid(row=0, column=0, sticky=tk.W)
@@ -350,80 +414,78 @@ class NexoraWorkerApp(tk.Tk):
         bar._pct_label = pct
         return bar
 
-    # ── Stats card ────────────────────────────────────────────────────────────
+    # ── Session Stats Card ────────────────────────────────────────────────────
     def _build_stats_card(self, parent):
         wrapper = tk.Frame(parent, bg=C_BG)
-        wrapper.pack(fill=tk.X, padx=16, pady=(0, 8))
+        wrapper.pack(fill=tk.X, padx=16, pady=(0, 10))
 
-        card = tk.Frame(wrapper, bg=C_CARD)
+        card = tk.Frame(wrapper, bg=C_CARD, highlightthickness=1, highlightbackground=C_BORDER)
         card.pack(fill=tk.X)
-        self._add_padding(card)
+        self._add_padding(card, py=10)
 
-        tk.Label(card, text="📈  SESSION STATS", font=("Segoe UI", 8, "bold"),
-                 fg=C_SUB, bg=C_CARD).pack(anchor=tk.W, pady=(0, 8))
+        tk.Label(card, text="📈  SESSION WORKLOAD METRICS", font=("Segoe UI", 8, "bold"),
+                 fg=C_SUB, bg=C_CARD).pack(anchor=tk.W, pady=(0, 6))
 
         row = tk.Frame(card, bg=C_CARD)
         row.pack(fill=tk.X)
 
-        self.stat_ok_lbl   = self._stat_col(row, "0",      "Completed",   C_GREEN)
+        self.stat_ok_lbl   = self._stat_box(row, "0",      "Completed", C_GREEN)
         self._sep(row)
-        self.stat_fail_lbl = self._stat_col(row, "0",      "Failed",      C_RED)
+        self.stat_fail_lbl = self._stat_box(row, "0",      "Failed",    C_RED)
         self._sep(row)
-        self.stat_time_lbl = self._stat_col(row, "0.0s",   "Compute",     C_BLUE)
+        self.stat_time_lbl = self._stat_box(row, "0.0s",   "Compute",   C_BLUE)
         self._sep(row)
-        self.stat_sess_lbl = self._stat_col(row, "00:00:00","Session",     C_SUB)
+        self.stat_sess_lbl = self._stat_box(row, "00:00:00","Session",  C_SUB)
 
-    def _stat_col(self, parent, num: str, label: str, color: str) -> tk.Label:
-        col = tk.Frame(parent, bg=C_CARD)
-        col.pack(side=tk.LEFT, expand=True, padx=8)
-        num_lbl = tk.Label(col, text=num, font=("Segoe UI", 22, "bold"), fg=color, bg=C_CARD)
+    def _stat_box(self, parent, num: str, label: str, color: str) -> tk.Label:
+        box = tk.Frame(parent, bg=C_CARD)
+        box.pack(side=tk.LEFT, expand=True, padx=4)
+        num_lbl = tk.Label(box, text=num, font=("Segoe UI", 20, "bold"), fg=color, bg=C_CARD)
         num_lbl.pack()
-        tk.Label(col, text=label, font=("Segoe UI", 8), fg=C_SUB, bg=C_CARD).pack()
+        tk.Label(box, text=label, font=("Segoe UI", 8), fg=C_SUB, bg=C_CARD).pack()
         return num_lbl
 
     def _sep(self, parent):
         tk.Frame(parent, bg=C_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
 
-    # ── Current task card ─────────────────────────────────────────────────────
+    # ── Active Task Card ──────────────────────────────────────────────────────
     def _build_task_card(self, parent):
         wrapper = tk.Frame(parent, bg=C_BG)
-        wrapper.pack(fill=tk.X, padx=16, pady=(0, 8))
+        wrapper.pack(fill=tk.X, padx=16, pady=(0, 10))
 
-        card = tk.Frame(wrapper, bg=C_CARD)
+        card = tk.Frame(wrapper, bg=C_CARD, highlightthickness=1, highlightbackground=C_BORDER)
         card.pack(fill=tk.X)
         self._add_padding(card, py=8)
 
         hdr = tk.Frame(card, bg=C_CARD)
         hdr.pack(fill=tk.X)
-        tk.Label(hdr, text="⚡  CURRENT TASK", font=("Segoe UI", 8, "bold"),
+        tk.Label(hdr, text="⚡  ACTIVE TASK EXECUTION", font=("Segoe UI", 8, "bold"),
                  fg=C_SUB, bg=C_CARD).pack(side=tk.LEFT)
         self.task_timer_lbl = tk.Label(hdr, text="", font=("Segoe UI", 9, "bold"),
                                        fg=C_PURPLE, bg=C_CARD)
         self.task_timer_lbl.pack(side=tk.RIGHT)
 
-        self.task_name_lbl = tk.Label(card, text="No task running",
-                                      font=("Segoe UI", 10, "italic"), fg=C_SUB, bg=C_CARD)
+        self.task_name_lbl = tk.Label(card, text="No task running (Node idle)",
+                                      font=("Segoe UI", 9, "italic"), fg=C_SUB, bg=C_CARD)
         self.task_name_lbl.pack(anchor=tk.W, pady=(4, 0))
 
-    # ── Connection card ───────────────────────────────────────────────────────
+    # ── Connection Drawer ─────────────────────────────────────────────────────
     def _build_conn_card(self, parent):
         wrapper = tk.Frame(parent, bg=C_BG)
-        wrapper.pack(fill=tk.X, padx=16, pady=(0, 4))
+        wrapper.pack(fill=tk.X, padx=16, pady=(0, 6))
 
-        # Header row (always visible)
         hdr = tk.Frame(wrapper, bg=C_BG)
-        hdr.pack(fill=tk.X, pady=(0, 2))
-        tk.Label(hdr, text="🌐  CONNECTION CONFIGURATION",
+        hdr.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(hdr, text="🌐  CONNECTION PREFERENCES",
                  font=("Segoe UI", 8, "bold"), fg=C_SUB, bg=C_BG).pack(side=tk.LEFT)
         self._toggle_btn = tk.Button(
-            hdr, text="▲ Collapse", font=("Segoe UI", 8), fg=C_SUB, bg=C_BG,
+            hdr, text="▲ Collapse", font=("Segoe UI", 8), fg=C_BLUE, bg=C_BG,
             bd=0, cursor="hand2", activebackground=C_BG,
             command=self._toggle_conn_card,
         )
         self._toggle_btn.pack(side=tk.RIGHT)
 
-        # Collapsible body
-        self._conn_body = tk.Frame(wrapper, bg=C_CARD)
+        self._conn_body = tk.Frame(wrapper, bg=C_CARD, highlightthickness=1, highlightbackground=C_BORDER)
         self._conn_body.pack(fill=tk.X)
         self._add_padding(self._conn_body)
 
@@ -435,18 +497,18 @@ class NexoraWorkerApp(tk.Tk):
 
         cfg = self.config_data
         fields = [
-            ("Master Host / URL:",      "entry_url",  cfg.get("master_url",    os.getenv("NEXORA_MASTER_URL", "http://127.0.0.1:5000")), False),
-            ("Worker Display Name:",    "entry_name", cfg.get("node_name",     f"{self.hardware['hostname']}-Worker"),                   False),
-            ("Pairing Code (Optional):","entry_code", cfg.get("pairing_code",  ""),                                                      False),
-            ("Worker Username:",        "entry_user", cfg.get("username",      "worker1"),                                               False),
-            ("Worker Password:",        "entry_pass", cfg.get("password",      "workerPassword123!"),                                    True),
+            ("Master Host / URL:",       "entry_url",  cfg.get("master_url",   os.getenv("NEXORA_MASTER_URL", "http://127.0.0.1:5000")), False),
+            ("Worker Display Name:",     "entry_name", cfg.get("node_name",    f"{self.hardware['hostname']}-Worker"),                   False),
+            ("Pairing Code (Optional):", "entry_code", cfg.get("pairing_code", ""),                                                      False),
+            ("Worker Username:",         "entry_user", cfg.get("username",     "worker1"),                                               False),
+            ("Worker Password:",         "entry_pass", cfg.get("password",     "workerPassword123!"),                                    True),
         ]
 
         self._conn_body.columnconfigure(1, weight=1)
         for i, (label, attr, default, masked) in enumerate(fields):
             tk.Label(self._conn_body, text=label, font=("Segoe UI", 9),
                      fg=C_SUB, bg=C_CARD).grid(row=i, column=0, sticky=tk.W, pady=4, padx=(0, 10))
-            e = tk.Entry(self._conn_body, width=46, show="*" if masked else "", **entry_kw)
+            e = tk.Entry(self._conn_body, show="*" if masked else "", **entry_kw)
             e.insert(0, default)
             e.grid(row=i, column=1, sticky=tk.EW, pady=4, ipady=3)
             setattr(self, attr, e)
@@ -460,10 +522,10 @@ class NexoraWorkerApp(tk.Tk):
             self._toggle_btn.config(text="▲ Collapse")
         self._conn_card_visible = not self._conn_card_visible
 
-    # ── Buttons ───────────────────────────────────────────────────────────────
+    # ── Control Buttons ───────────────────────────────────────────────────────
     def _build_buttons(self, parent):
         wrapper = tk.Frame(parent, bg=C_BG)
-        wrapper.pack(fill=tk.X, padx=16, pady=(8, 8))
+        wrapper.pack(fill=tk.X, padx=16, pady=(6, 10))
 
         self.btn_connect = ttk.Button(
             wrapper, text="🚀  Connect GPU / CPU to Cluster",
@@ -482,29 +544,24 @@ class NexoraWorkerApp(tk.Tk):
             style="Secondary.TButton", command=self._save_settings,
         ).pack(side=tk.LEFT, padx=(4, 0))
 
-    # ── Log section ───────────────────────────────────────────────────────────
+    # ── Real-Time Telemetry Stream ────────────────────────────────────────────
     def _build_log_section(self, parent):
         wrapper = tk.Frame(parent, bg=C_BG)
-        wrapper.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 12))
+        wrapper.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 14))
 
-        # Header row
         hdr = tk.Frame(wrapper, bg=C_BG)
-        hdr.pack(fill=tk.X, pady=(0, 2))
-        tk.Label(hdr, text="📋  LIVE ACTIVITY", font=("Segoe UI", 8, "bold"),
+        hdr.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(hdr, text="📋  REAL-TIME TELEMETRY STREAM", font=("Segoe UI", 8, "bold"),
                  fg=C_SUB, bg=C_BG).pack(side=tk.LEFT)
-        self.status_pill = tk.Label(hdr, text="● OFFLINE",
-                                    font=("Segoe UI", 9, "bold"), fg=C_RED, bg=C_BG)
-        self.status_pill.pack(side=tk.RIGHT)
 
-        # Filter + action bar
-        bar = tk.Frame(wrapper, bg=C_CARD)
+        bar = tk.Frame(wrapper, bg=C_CARD, highlightthickness=1, highlightbackground=C_BORDER)
         bar.pack(fill=tk.X, pady=(0, 2))
         pad = tk.Frame(bar, bg=C_CARD)
         pad.pack(fill=tk.X, padx=8, pady=4)
 
         tk.Label(pad, text="Filter:", font=("Segoe UI", 9),
                  fg=C_SUB, bg=C_CARD).pack(side=tk.LEFT, padx=(0, 6))
-        for text, val in [("All", "all"), ("Errors", "errors"), ("Tasks", "tasks")]:
+        for text, val in [("All", "all"), ("Tasks", "tasks"), ("Errors", "errors")]:
             tk.Radiobutton(
                 pad, text=text, variable=self._log_filter, value=val,
                 command=self._render_log_full,
@@ -517,35 +574,34 @@ class NexoraWorkerApp(tk.Tk):
         ttk.Button(pad, text="Clear", style="Secondary.TButton",
                    command=self._clear_log).pack(side=tk.RIGHT, padx=(4, 0))
 
-        # Log area
         self.log_area = scrolledtext.ScrolledText(
             wrapper, wrap=tk.WORD,
-            bg="#020617", fg="#e2e8f0", insertbackground=C_BLUE,
-            font=("Consolas", 9), borderwidth=0, relief="flat", height=14,
+            bg="#030712", fg="#e2e8f0", insertbackground=C_BLUE,
+            font=("Consolas", 9), borderwidth=1, relief="solid", height=14,
+            highlightbackground=C_BORDER
         )
         self.log_area.pack(fill=tk.BOTH, expand=True)
 
-        # Colour tags
-        self.log_area.tag_config("time",    foreground="#475569")
+        self.log_area.tag_config("time",    foreground="#64748b")
         self.log_area.tag_config("info",    foreground="#e2e8f0")
         self.log_area.tag_config("success", foreground=C_GREEN)
         self.log_area.tag_config("task",    foreground=C_LIME)
         self.log_area.tag_config("warning", foreground=C_YELLOW)
         self.log_area.tag_config("error",   foreground=C_RED)
 
-        self.log("Ready. Enter cluster master address and click 'Connect'.")
+        self.log("NEXORA Worker Agent Initialized. Enter cluster master URL and click 'Connect'.")
 
-    # ── Periodic update (gauges + timers) ─────────────────────────────────────
+    # ── Periodic Update Tick ──────────────────────────────────────────────────
     def _start_periodic_update(self):
         self._periodic_tick()
 
     def _periodic_tick(self):
-        # CPU gauge
+        # CPU
         cpu = psutil.cpu_percent()
         self.cpu_bar["value"] = cpu
         self.cpu_bar._pct_label.config(text=f"{cpu:.0f}%")
 
-        # RAM gauge
+        # RAM
         mem = psutil.virtual_memory()
         self.ram_bar["value"] = mem.percent
         used_gb = mem.used / 1024 ** 3
@@ -553,7 +609,7 @@ class NexoraWorkerApp(tk.Tk):
             text=f"{mem.percent:.0f}%  ({used_gb:.1f}/{self.hardware['ram_total_gb']}GB)"
         )
 
-        # GPU gauge (GPUtil optional)
+        # GPU
         if self.gpu_bar:
             try:
                 import GPUtil
@@ -571,25 +627,23 @@ class NexoraWorkerApp(tk.Tk):
         elapsed = int(time.time() - self._session_start)
         h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
         uptime_str = f"{h:02d}:{m:02d}:{s:02d}"
-        self.uptime_lbl.config(text=f"Session: {uptime_str}")
+        self.uptime_lbl.config(text=f"Session Uptime: {uptime_str}")
         self.stat_sess_lbl.config(text=uptime_str)
 
-        # Current task elapsed timer
+        # Active Task Elapsed
         if self._current_task:
             task_elapsed = time.time() - self._task_start
             self.task_timer_lbl.config(text=f"⏱ {task_elapsed:.1f}s")
 
         self.after(2000, self._periodic_tick)
 
-    # ── Log helpers ───────────────────────────────────────────────────────────
+    # ── Log Helpers ───────────────────────────────────────────────────────────
     def log(self, text: str, level: str = "info"):
-        """Thread-safe log. Schedules insertion on the main thread."""
         now = datetime.now().strftime("%H:%M:%S")
         self._log_entries.append((now, level, text))
         self.after(0, lambda ts=now, lv=level, tx=text: self._append_log_line(ts, lv, tx))
 
     def _append_log_line(self, ts: str, level: str, text: str):
-        """Append one line if it passes the current filter (main-thread only)."""
         f = self._log_filter.get()
         if f == "errors" and level != "error":
             return
@@ -602,7 +656,6 @@ class NexoraWorkerApp(tk.Tk):
         self.log_area.config(state=tk.DISABLED)
 
     def _render_log_full(self):
-        """Re-render entire log based on the selected filter."""
         self.log_area.config(state=tk.NORMAL)
         self.log_area.delete(1.0, tk.END)
         f = self._log_filter.get()
@@ -621,20 +674,20 @@ class NexoraWorkerApp(tk.Tk):
         self.log_area.config(state=tk.NORMAL)
         self.log_area.delete(1.0, tk.END)
         self.log_area.config(state=tk.DISABLED)
-        self.log("Log cleared.")
+        self.log("Telemetry log cleared.")
 
     def _export_log(self):
         path = filedialog.asksaveasfilename(
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("All", "*.*")],
-            initialfile=f"nexora_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            initialfile=f"nexora_telemetry_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
         )
         if path:
             lines = [f"[{ts}] {text}\n" for ts, _, text in self._log_entries]
             Path(path).write_text("".join(lines), encoding="utf-8")
-            self.log(f"Log exported → {path}", "success")
+            self.log(f"Telemetry exported to {path}", "success")
 
-    # ── Status pill ───────────────────────────────────────────────────────────
+    # ── Status Pill & Tray Sync ───────────────────────────────────────────────
     def set_status(self, text: str, color: str):
         self.after(0, lambda: self.status_pill.config(
             text=f"● {text.upper()}", fg=color
@@ -645,7 +698,7 @@ class NexoraWorkerApp(tk.Tk):
             except Exception:
                 pass
 
-    # ── Settings ──────────────────────────────────────────────────────────────
+    # ── Save Settings ─────────────────────────────────────────────────────────
     def _save_settings(self):
         data = {
             "master_url":   self.entry_url.get().strip(),
@@ -656,15 +709,15 @@ class NexoraWorkerApp(tk.Tk):
         }
         save_config(data)
         self.config_data = data
-        self.log("✅ Settings saved to ~/.nexora_worker/config.json", "success")
+        self.log("Settings persisted to ~/.nexora_worker/config.json", "success")
 
-    # ── Current task UI helpers ───────────────────────────────────────────────
+    # ── Current Task Management ───────────────────────────────────────────────
     def _set_task(self, name: str):
         self._current_task = name
         self._task_start   = time.time()
         self.after(0, lambda: [
             self.task_name_lbl.config(
-                text=f"⚡ {name}", fg=C_PURPLE, font=("Segoe UI", 10, "bold")
+                text=f"⚡ Running Task: {name}", fg=C_PURPLE, font=("Segoe UI", 9, "bold")
             ),
         ])
 
@@ -672,12 +725,12 @@ class NexoraWorkerApp(tk.Tk):
         self._current_task = None
         self.after(0, lambda: [
             self.task_name_lbl.config(
-                text="No task running", fg=C_SUB, font=("Segoe UI", 10, "italic")
+                text="No task running (Node idle)", fg=C_SUB, font=("Segoe UI", 9, "italic")
             ),
             self.task_timer_lbl.config(text=""),
         ])
 
-    # ── Stats update ──────────────────────────────────────────────────────────
+    # ── Stats Metrics Refresh ─────────────────────────────────────────────────
     def _refresh_stats(self):
         self.after(0, lambda: [
             self.stat_ok_lbl.config(text=str(self._tasks_completed)),
@@ -685,7 +738,7 @@ class NexoraWorkerApp(tk.Tk):
             self.stat_time_lbl.config(text=f"{self._total_compute_sec:.1f}s"),
         ])
 
-    # ── Notifications ─────────────────────────────────────────────────────────
+    # ── Desktop Notification ──────────────────────────────────────────────────
     def _notify(self, title: str, message: str):
         if HAS_NOTIFY:
             try:
@@ -696,22 +749,36 @@ class NexoraWorkerApp(tk.Tk):
             except Exception:
                 pass
 
-    # ── System tray ───────────────────────────────────────────────────────────
+    # ── System Tray ───────────────────────────────────────────────────────────
     def _make_tray_img(self, hex_color: str = C_RED) -> "Image.Image":
+        ico_png = get_asset_path("worker_icon.png")
+        if ico_png.is_file():
+            try:
+                base = Image.open(ico_png).convert("RGBA").resize((64, 64), Image.Resampling.LANCZOS)
+                draw = ImageDraw.Draw(base)
+                r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+                # Outer dark circle for contrast
+                draw.ellipse([43, 43, 61, 61], fill=(15, 23, 42, 255))
+                # Glowing indicator dot
+                draw.ellipse([45, 45, 59, 59], fill=(r, g, b, 255))
+                return base
+            except Exception:
+                pass
+
+        # Fallback drawn icon
         img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
         draw.ellipse([8, 8, 56, 56], fill=(r, g, b, 255))
-        # Draw "N" letter
         draw.text((22, 18), "N", fill=(255, 255, 255, 220))
         return img
 
     def _setup_tray(self):
         menu = pystray.Menu(
             pystray.MenuItem("Open NEXORA Worker", self._tray_open, default=True),
-            pystray.MenuItem("Disconnect",         lambda: self.after(0, self.stop_worker)),
+            pystray.MenuItem("Disconnect Node",   lambda: self.after(0, self.stop_worker)),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit",               self._tray_quit),
+            pystray.MenuItem("Exit Completely",   self._tray_quit),
         )
         self._tray_icon = pystray.Icon(
             "NEXORA Worker", self._make_tray_img(C_RED), "NEXORA Worker", menu
@@ -727,7 +794,7 @@ class NexoraWorkerApp(tk.Tk):
     def _on_close(self):
         if HAS_TRAY and self._tray_icon:
             self.withdraw()
-            self._notify("NEXORA Worker", "Running in background. Right-click tray icon to quit.")
+            self._notify("NEXORA Worker", "Worker minimized to system tray. Right-click tray icon to exit.")
         else:
             self._quit_app()
 
@@ -740,7 +807,7 @@ class NexoraWorkerApp(tk.Tk):
                 pass
         self.destroy()
 
-    # ── Worker start / stop ───────────────────────────────────────────────────
+    # ── Worker Startup & Shutdown ─────────────────────────────────────────────
     def start_worker(self):
         url      = self.entry_url.get().strip()
         username = self.entry_user.get().strip()
@@ -749,11 +816,11 @@ class NexoraWorkerApp(tk.Tk):
         code     = self.entry_code.get().strip() or None
 
         if not url or not username or not password:
-            messagebox.showerror("Validation Error", "Master URL, Username, and Password are required.")
+            messagebox.showerror("Configuration Error", "Master URL, Username, and Password are required.")
             return
 
-        # Reset stats
-        self._tasks_completed = self._tasks_failed = 0
+        self._tasks_completed   = 0
+        self._tasks_failed      = 0
         self._total_compute_sec = 0.0
         self._refresh_stats()
 
@@ -770,7 +837,7 @@ class NexoraWorkerApp(tk.Tk):
         self.worker_thread.start()
 
     def stop_worker(self):
-        self.log("Stopping worker...")
+        self.log("Deregistering worker node...")
         self.is_running = False
         self._clear_task()
         self.after(0, lambda: [
@@ -779,7 +846,7 @@ class NexoraWorkerApp(tk.Tk):
             self.set_status("OFFLINE", C_RED),
         ])
 
-    # ── Worker loop ───────────────────────────────────────────────────────────
+    # ── Master Cluster Communication Loop ─────────────────────────────────────
     def _worker_loop(
         self,
         master_url:   str,
@@ -794,8 +861,8 @@ class NexoraWorkerApp(tk.Tk):
         session = requests.Session()
         session.headers.update({"Content-Type": "application/json"})
 
-        # ── 1. Authenticate ────────────────────────────────────────────────
-        self.log(f"Authenticating with master at {master_url}...")
+        # 1. Authentication
+        self.log(f"Authenticating with cluster master at {master_url}...")
         token: Optional[str] = None
         try:
             r = session.post(
@@ -805,9 +872,9 @@ class NexoraWorkerApp(tk.Tk):
             )
             if r.status_code == 200:
                 token = r.json().get("access_token")
-                self.log(f"Login successful for user '{username}'.")
+                self.log(f"Authenticated successfully as '{username}'.")
             elif r.status_code == 401:
-                self.log("Account not found — attempting auto-registration...")
+                self.log("Account not found. Requesting auto-registration as worker operator...")
                 reg = session.post(
                     f"{master_url}/api/v1/auth/register",
                     json={
@@ -819,28 +886,28 @@ class NexoraWorkerApp(tk.Tk):
                 )
                 if reg.status_code in (200, 201):
                     token = reg.json().get("access_token")
-                    self.log("Auto-registration successful.")
+                    self.log("Auto-registration granted by cluster.")
                 elif reg.status_code == 409:
-                    self.log(f"Wrong password for '{username}'. Please check credentials.", "error")
+                    self.log(f"Authentication failed: password incorrect for user '{username}'.", "error")
                     self.after(0, self.stop_worker)
                     return
                 else:
-                    self.log(f"Registration failed: {reg.text}", "error")
+                    self.log(f"Registration rejected: {reg.text}", "error")
                     self.after(0, self.stop_worker)
                     return
             else:
-                self.log(f"Master error: HTTP {r.status_code}", "error")
+                self.log(f"Master response error: HTTP {r.status_code}", "error")
                 self.after(0, self.stop_worker)
                 return
         except Exception as ex:
-            self.log(f"Network error during auth: {ex}", "error")
+            self.log(f"Network error during authentication: {ex}", "error")
             self.after(0, self.stop_worker)
             return
 
         session.headers.update({"Authorization": f"Bearer {token}"})
 
-        # ── 2. Pairing request ─────────────────────────────────────────────
-        self.log(f"Submitting join request for node '{node_name}'...")
+        # 2. Pairing Request
+        self.log(f"Registering node '{node_name}' to cluster registry...")
         local_ip: Optional[str] = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -855,36 +922,36 @@ class NexoraWorkerApp(tk.Tk):
 
         gpu_bytes = int(self.hardware["gpu_vram_gb"] * 1024 ** 3) if self.hardware["gpu_vram_gb"] > 0 else None
         pair_payload = {
-            "code":            pairing_code,
-            "node_name":       node_name,
-            "hostname":        self.hardware["hostname"],
-            "operating_system":self.hardware["os"],
-            "private_ipv4":    local_ip,
-            "cpu_model":       self.hardware["cpu_model"],
-            "cpu_threads":     self.hardware["cpu_threads"],
-            "ram_total_bytes": int(self.hardware["ram_total_gb"] * 1024 ** 3),
-            "gpu_model":       self.hardware["gpu_model"] if self.hardware["gpu_vram_gb"] > 0 else None,
-            "gpu_vendor":      self.hardware["gpu_vendor"],
-            "gpu_vram_bytes":  gpu_bytes,
-            "compute_backend": "opencl" if self.hardware["gpu_vram_gb"] > 0 else "cpu",
+            "code":             pairing_code,
+            "node_name":        node_name,
+            "hostname":         self.hardware["hostname"],
+            "operating_system": self.hardware["os"],
+            "private_ipv4":     local_ip,
+            "cpu_model":        self.hardware["cpu_model"],
+            "cpu_threads":      self.hardware["cpu_threads"],
+            "ram_total_bytes":  int(self.hardware["ram_total_gb"] * 1024 ** 3),
+            "gpu_model":        self.hardware["gpu_model"] if self.hardware["gpu_vram_gb"] > 0 else None,
+            "gpu_vendor":       self.hardware["gpu_vendor"],
+            "gpu_vram_bytes":   gpu_bytes,
+            "compute_backend":  "opencl" if self.hardware["gpu_vram_gb"] > 0 else "cpu",
         }
         try:
             r = session.post(f"{master_url}/api/v1/pairing/requests", json=pair_payload, timeout=8)
             if r.status_code in (200, 201):
                 node_id = r.json()["id"]
-                self.log(f"Join request created!  Node ID: {node_id}")
+                self.log(f"Cluster join request accepted. Assigned Node ID: {node_id}")
             else:
-                self.log(f"Pairing failed: {r.text}", "error")
+                self.log(f"Pairing request rejected: {r.text}", "error")
                 self.after(0, self.stop_worker)
                 return
         except Exception as ex:
-            self.log(f"Pairing error: {ex}", "error")
+            self.log(f"Error during node pairing: {ex}", "error")
             self.after(0, self.stop_worker)
             return
 
-        # ── 3. Wait for admin approval ─────────────────────────────────────
+        # 3. Awaiting Approval Loop
         self.set_status("AWAITING APPROVAL", C_YELLOW)
-        self.log("⏳ Waiting for Master Admin to approve in Dashboard...")
+        self.log("Waiting for Cluster Administrator approval in Web Dashboard...")
 
         approved = False
         while self.is_running and not approved:
@@ -900,26 +967,26 @@ class NexoraWorkerApp(tk.Tk):
                 )
                 if hb.status_code == 200:
                     approved = True
-                    self.log("🎉 Node APPROVED by Admin! Connected to Cluster.", "success")
+                    self.log("Node APPROVED by Cluster Admin! Ready for distributed compute workloads.", "success")
                     self.set_status("ONLINE & READY", C_GREEN)
-                    self._notify("NEXORA Worker", "🎉 Node approved — connected to cluster!")
+                    self._notify("NEXORA Cluster", "Node approved and connected to distributed cluster!")
                 elif hb.status_code == 403:
                     time.sleep(2.5)
                 else:
                     time.sleep(3.0)
             except Exception as ex:
-                self.log(f"Waiting for approval… ({ex})", "warning")
+                self.log(f"Heartbeat probe waiting for approval ({ex})", "warning")
                 time.sleep(3.0)
 
-        # ── 4. Active loop — heartbeat + task lease ────────────────────────
-        HB_INTERVAL      = 2.0
-        last_hb          = time.time()
-        reconnect_count  = 0
+        # 4. Active Work & Telemetry Loop
+        HB_INTERVAL     = 2.0
+        last_hb         = time.time()
+        reconnect_count = 0
 
         while self.is_running:
             now = time.time()
 
-            # Heartbeat
+            # Heartbeat & Telemetry
             if now - last_hb >= HB_INTERVAL:
                 try:
                     session.post(
@@ -932,30 +999,27 @@ class NexoraWorkerApp(tk.Tk):
                         timeout=5,
                     )
                     last_hb = now
-                    reconnect_count = 0        # Reset on success
-
+                    reconnect_count = 0
                 except requests.exceptions.ConnectionError:
                     reconnect_count += 1
                     if reconnect_count <= MAX_RECONNECT:
                         rc = reconnect_count
                         self.log(
-                            f"⚠️ Connection lost — retrying in {RECONNECT_DELAY}s "
-                            f"({rc}/{MAX_RECONNECT})...",
+                            f"Connection dropped — reconnecting in {RECONNECT_DELAY}s ({rc}/{MAX_RECONNECT})...",
                             "warning",
                         )
                         self.set_status(f"RECONNECTING {rc}/{MAX_RECONNECT}", C_YELLOW)
                         time.sleep(RECONNECT_DELAY)
                         continue
                     else:
-                        self.log("❌ Max reconnect attempts reached. Disconnecting.", "error")
-                        self._notify("NEXORA Worker", "⚠️ Lost connection — disconnected.")
+                        self.log("Maximum reconnect attempts reached. Cluster unreachable.", "error")
+                        self._notify("NEXORA Worker", "Lost connection to master cluster.")
                         self.after(0, self.stop_worker)
                         return
-
                 except Exception:
                     pass
 
-            # Lease task
+            # Task Leasing
             try:
                 lr = session.post(
                     f"{master_url}/api/v1/worker/nodes/{node_id}/tasks/lease",
@@ -968,13 +1032,12 @@ class NexoraWorkerApp(tk.Tk):
                     task_id     = task["id"]
                     task_key    = task["task_key"]
 
-                    self.log(f"⚡ Leased task '{task_key}' — executing...", "task")
+                    self.log(f"Leased compute task '{task_key}' — executing workload...", "task")
                     self.set_status("COMPUTING", C_PURPLE)
                     self._set_task(task_key)
 
                     t0 = time.time()
                     try:
-                        # Download workload if needed
                         workload_zip: Optional[Path] = None
                         wid = task.get("workload_id")
                         if wid:
@@ -982,7 +1045,7 @@ class NexoraWorkerApp(tk.Tk):
                             cache.mkdir(parents=True, exist_ok=True)
                             cached = cache / f"{wid}.zip"
                             if not cached.is_file():
-                                self.log("📥 Downloading workload package...")
+                                self.log(f"Downloading workload package {wid[:8]}...")
                                 dl = session.get(
                                     f"{master_url}/api/v1/worker/workloads/{wid}/download",
                                     timeout=30,
@@ -1002,9 +1065,9 @@ class NexoraWorkerApp(tk.Tk):
 
                         dur = round(time.time() - t0, 3)
 
-                        # Upload artifacts if any
+                        # Artifacts Upload
                         if artifact_zip and os.path.isfile(artifact_zip):
-                            self.log("📦 Uploading output artifacts...")
+                            self.log("Uploading output artifacts to master...")
                             with open(artifact_zip, "rb") as fh:
                                 session.post(
                                     f"{master_url}/api/v1/worker/tasks/{task_id}/artifacts",
@@ -1012,7 +1075,7 @@ class NexoraWorkerApp(tk.Tk):
                                     timeout=60,
                                 )
 
-                        # Submit result
+                        # Submit Result
                         sub = session.post(
                             f"{master_url}/api/v1/worker/tasks/{task_id}/result",
                             json={"lease_token": lease_token, "status": "succeeded", "result": res},
@@ -1022,22 +1085,21 @@ class NexoraWorkerApp(tk.Tk):
                             self._tasks_completed += 1
                             self._total_compute_sec += dur
                             self._refresh_stats()
-                            self.log(f"✅ '{task_key}' done in {dur}s", "success")
-                            self._notify("NEXORA Worker", f"✅ Task '{task_key}' done in {dur}s")
+                            self.log(f"Workload '{task_key}' completed in {dur}s!", "success")
+                            self._notify("NEXORA Worker", f"Task '{task_key}' completed in {dur}s")
                         else:
-                            self.log(f"Result submission error: {sub.text}", "error")
+                            self.log(f"Result submission failed: {sub.text}", "error")
 
                     except Exception as exc:
                         self._tasks_failed += 1
                         self._refresh_stats()
                         err = str(exc)
-                        self.log(f"❌ '{task_key}' failed: {err}", "error")
-                        self._notify("NEXORA Worker", f"❌ Task '{task_key}' failed")
+                        self.log(f"Task '{task_key}' error: {err}", "error")
+                        self._notify("NEXORA Worker", f"Task '{task_key}' failed")
                         try:
                             session.post(
                                 f"{master_url}/api/v1/worker/tasks/{task_id}/result",
-                                json={"lease_token": lease_token, "status": "failed",
-                                      "error": err[:4000]},
+                                json={"lease_token": lease_token, "status": "failed", "error": err[:4000]},
                                 timeout=6,
                             )
                         except Exception:
@@ -1053,11 +1115,10 @@ class NexoraWorkerApp(tk.Tk):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     @staticmethod
-    def _add_padding(frame: tk.Frame, px: int = 12, py: int = 12):
+    def _add_padding(frame: tk.Frame, px: int = 14, py: int = 12):
         frame.config(padx=px, pady=py)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     app = NexoraWorkerApp()
     app.mainloop()
