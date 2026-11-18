@@ -1,0 +1,16 @@
+# NEXORA Worker GUI — Python dependencies
+# Install with: pip install -r nexora_worker_gui/requirements.txt
+
+# Core (required)
+psutil>=5.9,<7
+requests>=2.31,<3
+
+# System tray support (optional — enables minimize-to-tray)
+pystray>=0.19,<1
+Pillow>=10,<12
+
+# Desktop notifications (optional — enables toast notifications)
+plyer>=2.1,<3
+
+# GPU utilization gauges (optional — enables live GPU % bar)
+# gputil>=1.4,<2
