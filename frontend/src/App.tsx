@@ -343,8 +343,8 @@ function WorkloadsView({
   const totalCores = onlineApprovedNodes.reduce((acc, n) => acc + (n.cpu_threads || 1), 0);
   const detectedGpus = onlineApprovedNodes.map((n) => n.gpu_model).filter((m) => m && m !== "None (CPU Compute)").join(", ");
 
-  const [name, setName] = useState("Square batch");
-  const [operation, setOperation] = useState("square");
+  const [name, setName] = useState("Distributed Python Job");
+  const [operation, setOperation] = useState("execute_script");
   const [backend, setBackend] = useState("cpu");
   const [file, setFile] = useState<File | null>(null);
   const [selectedWorkload, setSelectedWorkload] = useState("");
@@ -354,7 +354,7 @@ function WorkloadsView({
   const [autoSliceCount, setAutoSliceCount] = useState(2);
   const [hasUserCustomizedSlices, setHasUserCustomizedSlices] = useState(false);
   const [manualSelectedNodeIds, setManualSelectedNodeIds] = useState<string[]>([]);
-  const [taskJson, setTaskJson] = useState('[{"task_key":"item-1","payload":{"operation":"square","value":2}}]');
+  const [taskJson, setTaskJson] = useState('[{"task_key":"task-01","payload":{"operation":"execute_script","code":"print(\'NEXORA Node Ready\')\\nresult = {\'status\': \'healthy\'}\\n"}}]');
   const [jobName, setJobName] = useState("Distributed Execution Batch");
   const [schedulingPolicy, setSchedulingPolicy] = useState<"automatic" | "manual" | "hybrid">("automatic");
   const [allocations, setAllocations] = useState<Record<string, number>>({});
@@ -594,7 +594,7 @@ function WorkloadsView({
     }
   }
 
-  function loadPreset(type: "quick5" | "batch20" | "matmul" | "ml4gpu") {
+  function loadPreset(type: "quick5" | "ml4gpu") {
     if (type === "ml4gpu") {
       setTaskJson(JSON.stringify([
         { task_key: "fold-1-gpu", payload: { operation: "execute_script", fold: 1, code: "import json, pickle, time\ntime.sleep(1)\nwith open('task_input.json') as f: params = json.load(f)\nmodel = {'fold': params.get('fold'), 'val_accuracy': 0.942, 'weights': [0.12, 0.45, 0.89]}\nwith open('model_fold1.pkl', 'wb') as f: pickle.dump(model, f)\nwith open('metrics_fold1.json', 'w') as f: json.dump(model, f)\nprint('Fold 1 Training Complete! Saved model_fold1.pkl & metrics_fold1.json')\n" } },
@@ -605,27 +605,13 @@ function WorkloadsView({
       setJobName("4-Worker Distributed ML Fold Training");
     } else if (type === "quick5") {
       setTaskJson(JSON.stringify([
-        { task_key: "math-01", payload: { operation: "square", value: 4 } },
-        { task_key: "math-02", payload: { operation: "square", value: 16 } },
-        { task_key: "math-03", payload: { operation: "square", value: 64 } },
-        { task_key: "math-04", payload: { operation: "square", value: 256 } },
-        { task_key: "math-05", payload: { operation: "square", value: 1024 } }
+        { task_key: "ping-01", payload: { operation: "execute_script", code: "print('Node 1 Online & Verified')\nresult = {'status': 'healthy', 'node': 1}\n" } },
+        { task_key: "ping-02", payload: { operation: "execute_script", code: "print('Node 2 Online & Verified')\nresult = {'status': 'healthy', 'node': 2}\n" } },
+        { task_key: "ping-03", payload: { operation: "execute_script", code: "print('Node 3 Online & Verified')\nresult = {'status': 'healthy', 'node': 3}\n" } },
+        { task_key: "ping-04", payload: { operation: "execute_script", code: "print('Node 4 Online & Verified')\nresult = {'status': 'healthy', 'node': 4}\n" } },
+        { task_key: "ping-05", payload: { operation: "execute_script", code: "print('Node 5 Online & Verified')\nresult = {'status': 'healthy', 'node': 5}\n" } }
       ], null, 2));
-      setJobName("5 Quick Parallel Computations");
-    } else if (type === "batch20") {
-      const items = Array.from({ length: 20 }, (_, i) => ({
-        task_key: `batch-${String(i + 1).padStart(2, "0")}`,
-        payload: { operation: "square", value: (i + 1) * 7 }
-      }));
-      setTaskJson(JSON.stringify(items, null, 2));
-      setJobName("20 High-Throughput Batch Tasks");
-    } else if (type === "matmul") {
-      setTaskJson(JSON.stringify([
-        { task_key: "matmul-01", payload: { operation: "matmul", matrix_a: [[1, 2], [3, 4]], matrix_b: [[5, 6], [7, 8]] } },
-        { task_key: "matmul-02", payload: { operation: "matmul", matrix_a: [[3, 1], [2, 5]], matrix_b: [[2, 4], [1, 3]] } },
-        { task_key: "matmul-03", payload: { operation: "matmul", matrix_a: [[6, 2], [1, 4]], matrix_b: [[3, 1], [4, 2]] } }
-      ], null, 2));
-      setJobName("GPU Matrix Multiplication Batch");
+      setJobName("Cluster Connectivity Verification");
     }
   }
 
@@ -746,12 +732,8 @@ function WorkloadsView({
               <div className="form-row">
                 <label>Operation
                   <select value={operation} onChange={(event) => setOperation(event.target.value)}>
-                    <option value="execute_script">execute_script (Python)</option>
-                    <option value="execute_notebook">execute_notebook (Jupyter)</option>
-                    <option value="square">square (Built-in Demo)</option>
-                    <option value="sum">sum (Built-in Demo)</option>
-                    <option value="matmul">matmul (GPU Matrix)</option>
-                    <option value="identity">identity</option>
+                    <option value="execute_script">execute_script (Python Script)</option>
+                    <option value="execute_notebook">execute_notebook (Jupyter Notebook)</option>
                   </select>
                 </label>
                 <label>Backend
@@ -1097,11 +1079,9 @@ function WorkloadsView({
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "10px 0 6px 0" }}>
                     <span style={{ fontWeight: 600, fontSize: "12px", color: "#94a3b8" }}>Task JSON Array</span>
                     <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-                      <button type="button" onClick={() => loadPreset("ml4gpu")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#3b0764", color: "#c084fc", border: "1px solid #7e22ce", cursor: "pointer", fontWeight: 700 }}>🧪 4-Worker ML</button>
-                      <button type="button" onClick={() => loadPreset("quick5")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#38bdf8", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>⚡ 5 Math</button>
-                      <button type="button" onClick={() => loadPreset("batch20")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#4ade80", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>🚀 20 Batch</button>
-                      <button type="button" onClick={() => loadPreset("matmul")} style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "4px", background: "#1e293b", color: "#facc15", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>🧮 MatMul</button>
-                      <button type="button" onClick={() => setTaskJson("[]")} title="Clear JSON" style={{ fontSize: "11px", padding: "3px 6px", borderRadius: "4px", background: "#1e293b", color: "#94a3b8", border: "1px solid #334155", cursor: "pointer" }}>✕</button>
+                      <button type="button" onClick={() => loadPreset("ml4gpu")} style={{ fontSize: "11px", padding: "4px 10px", borderRadius: "6px", background: "#3b0764", color: "#c084fc", border: "1px solid #7e22ce", cursor: "pointer", fontWeight: 700 }}>🧪 4-Worker ML Training</button>
+                      <button type="button" onClick={() => loadPreset("quick5")} style={{ fontSize: "11px", padding: "4px 10px", borderRadius: "6px", background: "#1e293b", color: "#38bdf8", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>⚡ Cluster Ping (5 Nodes)</button>
+                      <button type="button" onClick={() => setTaskJson("[]")} title="Clear JSON" style={{ fontSize: "11px", padding: "4px 8px", borderRadius: "6px", background: "#1e293b", color: "#94a3b8", border: "1px solid #334155", cursor: "pointer" }}>✕ Clear</button>
                     </div>
                   </div>
                   <textarea value={taskJson} onChange={(event) => setTaskJson(event.target.value)} rows={4} style={{ fontFamily: "monospace", fontSize: "12px" }} />
