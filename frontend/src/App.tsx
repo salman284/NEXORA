@@ -348,16 +348,13 @@ function WorkloadsView({
   const [backend, setBackend] = useState("cpu");
   const [file, setFile] = useState<File | null>(null);
   const [selectedWorkload, setSelectedWorkload] = useState("");
-  const [dispatchMode, setDispatchMode] = useState<"single" | "auto" | "manual" | "advanced">("auto");
+  const [dispatchMode, setDispatchMode] = useState<"single" | "auto" | "manual">("auto");
   const [singleTaskKey, setSingleTaskKey] = useState("main-run");
   const [autoTargetGpuOnly, setAutoTargetGpuOnly] = useState(true);
   const [autoSliceCount, setAutoSliceCount] = useState(2);
   const [hasUserCustomizedSlices, setHasUserCustomizedSlices] = useState(false);
   const [manualSelectedNodeIds, setManualSelectedNodeIds] = useState<string[]>([]);
-  const [taskJson, setTaskJson] = useState('[{"task_key":"task-01","payload":{"operation":"execute_script","code":"print(\'NEXORA Node Ready\')\\nresult = {\'status\': \'healthy\'}\\n"}}]');
   const [jobName, setJobName] = useState("Distributed Execution Batch");
-  const [schedulingPolicy, setSchedulingPolicy] = useState<"automatic" | "manual" | "hybrid">("automatic");
-  const [allocations, setAllocations] = useState<Record<string, number>>({});
   const [busy, setBusy] = useState(false);
   const [selectedJobId, setSelectedJobId] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -466,11 +463,6 @@ function WorkloadsView({
           pinned_node_id: n.id
         }));
         finalPolicy = "manual";
-      } else {
-        // Advanced JSON mode
-        parsedTasks = JSON.parse(taskJson);
-        finalPolicy = schedulingPolicy;
-        finalConfig = { allocations };
       }
 
       await api<Job>("/api/v1/jobs", {
@@ -594,26 +586,7 @@ function WorkloadsView({
     }
   }
 
-  function loadPreset(type: "quick5" | "ml4gpu") {
-    if (type === "ml4gpu") {
-      setTaskJson(JSON.stringify([
-        { task_key: "fold-1-gpu", payload: { operation: "execute_script", fold: 1, code: "import json, pickle, time\ntime.sleep(1)\nwith open('task_input.json') as f: params = json.load(f)\nmodel = {'fold': params.get('fold'), 'val_accuracy': 0.942, 'weights': [0.12, 0.45, 0.89]}\nwith open('model_fold1.pkl', 'wb') as f: pickle.dump(model, f)\nwith open('metrics_fold1.json', 'w') as f: json.dump(model, f)\nprint('Fold 1 Training Complete! Saved model_fold1.pkl & metrics_fold1.json')\n" } },
-        { task_key: "fold-2-gpu", payload: { operation: "execute_script", fold: 2, code: "import json, pickle, time\ntime.sleep(1)\nwith open('task_input.json') as f: params = json.load(f)\nmodel = {'fold': params.get('fold'), 'val_accuracy': 0.958, 'weights': [0.22, 0.55, 0.81]}\nwith open('model_fold2.pkl', 'wb') as f: pickle.dump(model, f)\nwith open('metrics_fold2.json', 'w') as f: json.dump(model, f)\nprint('Fold 2 Training Complete! Saved model_fold2.pkl & metrics_fold2.json')\n" } },
-        { task_key: "fold-3-gpu", payload: { operation: "execute_script", fold: 3, code: "import json, pickle, time\ntime.sleep(1)\nwith open('task_input.json') as f: params = json.load(f)\nmodel = {'fold': params.get('fold'), 'val_accuracy': 0.963, 'weights': [0.32, 0.61, 0.74]}\nwith open('model_fold3.pkl', 'wb') as f: pickle.dump(model, f)\nwith open('metrics_fold3.json', 'w') as f: json.dump(model, f)\nprint('Fold 3 Training Complete! Saved model_fold3.pkl & metrics_fold3.json')\n" } },
-        { task_key: "fold-4-gpu", payload: { operation: "execute_script", fold: 4, code: "import json, pickle, time\ntime.sleep(1)\nwith open('task_input.json') as f: params = json.load(f)\nmodel = {'fold': params.get('fold'), 'val_accuracy': 0.971, 'weights': [0.42, 0.73, 0.68]}\nwith open('model_fold4.pkl', 'wb') as f: pickle.dump(model, f)\nwith open('metrics_fold4.json', 'w') as f: json.dump(model, f)\nprint('Fold 4 Training Complete! Saved model_fold4.pkl & metrics_fold4.json')\n" } }
-      ], null, 2));
-      setJobName("4-Worker Distributed ML Fold Training");
-    } else if (type === "quick5") {
-      setTaskJson(JSON.stringify([
-        { task_key: "ping-01", payload: { operation: "execute_script", code: "print('Node 1 Online & Verified')\nresult = {'status': 'healthy', 'node': 1}\n" } },
-        { task_key: "ping-02", payload: { operation: "execute_script", code: "print('Node 2 Online & Verified')\nresult = {'status': 'healthy', 'node': 2}\n" } },
-        { task_key: "ping-03", payload: { operation: "execute_script", code: "print('Node 3 Online & Verified')\nresult = {'status': 'healthy', 'node': 3}\n" } },
-        { task_key: "ping-04", payload: { operation: "execute_script", code: "print('Node 4 Online & Verified')\nresult = {'status': 'healthy', 'node': 4}\n" } },
-        { task_key: "ping-05", payload: { operation: "execute_script", code: "print('Node 5 Online & Verified')\nresult = {'status': 'healthy', 'node': 5}\n" } }
-      ], null, 2));
-      setJobName("Cluster Connectivity Verification");
-    }
-  }
+
 
   const selectedJob = jobs.find((job) => job.id === selectedJobId);
 
@@ -773,18 +746,18 @@ function WorkloadsView({
               <span style={{ fontSize: "11px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "#94a3b8", display: "block", marginBottom: "6px" }}>
                 Distribution Strategy
               </span>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "5px", marginBottom: "10px" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "6px", marginBottom: "10px" }}>
                 <button
                   type="button"
                   onClick={() => setDispatchMode("single")}
                   style={{
-                    padding: "8px 4px",
+                    padding: "9px 6px",
                     borderRadius: "6px",
                     border: dispatchMode === "single" ? "1px solid #d3f36b" : "1px solid #334155",
                     background: dispatchMode === "single" ? "rgba(211, 243, 107, 0.15)" : "#0f172a",
                     color: dispatchMode === "single" ? "#d3f36b" : "#94a3b8",
                     fontWeight: 700,
-                    fontSize: "11px",
+                    fontSize: "12px",
                     cursor: "pointer",
                     textAlign: "center"
                   }}
@@ -795,13 +768,13 @@ function WorkloadsView({
                   type="button"
                   onClick={() => setDispatchMode("auto")}
                   style={{
-                    padding: "8px 4px",
+                    padding: "9px 6px",
                     borderRadius: "6px",
                     border: dispatchMode === "auto" ? "1px solid #d3f36b" : "1px solid #334155",
                     background: dispatchMode === "auto" ? "rgba(211, 243, 107, 0.15)" : "#0f172a",
                     color: dispatchMode === "auto" ? "#d3f36b" : "#94a3b8",
                     fontWeight: 700,
-                    fontSize: "11px",
+                    fontSize: "12px",
                     cursor: "pointer",
                     textAlign: "center"
                   }}
@@ -812,35 +785,18 @@ function WorkloadsView({
                   type="button"
                   onClick={() => setDispatchMode("manual")}
                   style={{
-                    padding: "8px 4px",
+                    padding: "9px 6px",
                     borderRadius: "6px",
                     border: dispatchMode === "manual" ? "1px solid #d3f36b" : "1px solid #334155",
                     background: dispatchMode === "manual" ? "rgba(211, 243, 107, 0.15)" : "#0f172a",
                     color: dispatchMode === "manual" ? "#d3f36b" : "#94a3b8",
                     fontWeight: 700,
-                    fontSize: "11px",
+                    fontSize: "12px",
                     cursor: "pointer",
                     textAlign: "center"
                   }}
                 >
                   🎛️ Manual Pick
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDispatchMode("advanced")}
-                  style={{
-                    padding: "8px 4px",
-                    borderRadius: "6px",
-                    border: dispatchMode === "advanced" ? "1px solid #d3f36b" : "1px solid #334155",
-                    background: dispatchMode === "advanced" ? "rgba(211, 243, 107, 0.15)" : "#0f172a",
-                    color: dispatchMode === "advanced" ? "#d3f36b" : "#94a3b8",
-                    fontWeight: 700,
-                    fontSize: "11px",
-                    cursor: "pointer",
-                    textAlign: "center"
-                  }}
-                >
-                  ⚙️ JSON Mode
                 </button>
               </div>
 
@@ -1049,44 +1005,7 @@ function WorkloadsView({
                 </div>
               )}
 
-              {/* Mode 4: Advanced JSON */}
-              {dispatchMode === "advanced" && (
-                <div>
-                  <label>Scheduling Policy
-                    <select value={schedulingPolicy} onChange={(event) => setSchedulingPolicy(event.target.value as any)}>
-                      <option value="automatic">Mode A: Automatic (Dynamic based on VRAM/GPU/CPU)</option>
-                      <option value="manual">Mode B: Manual Distribution (Target specific Workers)</option>
-                      <option value="hybrid">Mode C: Hybrid (Target Workers for subset, auto-distribute rest)</option>
-                    </select>
-                  </label>
-                  {schedulingPolicy !== "automatic" && (
-                    <div className="allocation-box" style={{ margin: "8px 0" }}>
-                      <span className="eyebrow">Worker Allocation Targets</span>
-                      {approvedNodes.map((n) => (
-                        <div key={n.id} className="allocation-item">
-                          <span>{n.node_name} ({n.gpu_model || "CPU"})</span>
-                          <input
-                            type="number"
-                            min="0"
-                            placeholder="Share / %"
-                            value={allocations[n.id] ?? ""}
-                            onChange={(e) => setAllocations({ ...allocations, [n.id]: Number(e.target.value) })}
-                          />
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "10px 0 6px 0" }}>
-                    <span style={{ fontWeight: 600, fontSize: "12px", color: "#94a3b8" }}>Task JSON Array</span>
-                    <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-                      <button type="button" onClick={() => loadPreset("ml4gpu")} style={{ fontSize: "11px", padding: "4px 10px", borderRadius: "6px", background: "#3b0764", color: "#c084fc", border: "1px solid #7e22ce", cursor: "pointer", fontWeight: 700 }}>🧪 4-Worker ML Training</button>
-                      <button type="button" onClick={() => loadPreset("quick5")} style={{ fontSize: "11px", padding: "4px 10px", borderRadius: "6px", background: "#1e293b", color: "#38bdf8", border: "1px solid #334155", cursor: "pointer", fontWeight: 600 }}>⚡ Cluster Ping (5 Nodes)</button>
-                      <button type="button" onClick={() => setTaskJson("[]")} title="Clear JSON" style={{ fontSize: "11px", padding: "4px 8px", borderRadius: "6px", background: "#1e293b", color: "#94a3b8", border: "1px solid #334155", cursor: "pointer" }}>✕ Clear</button>
-                    </div>
-                  </div>
-                  <textarea value={taskJson} onChange={(event) => setTaskJson(event.target.value)} rows={4} style={{ fontFamily: "monospace", fontSize: "12px" }} />
-                </div>
-              )}
+
             </div>
 
             <button className="primary-button" type="submit" style={{ marginTop: "6px" }}>Create task-parallel job</button>
