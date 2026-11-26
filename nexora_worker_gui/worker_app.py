@@ -1055,13 +1055,37 @@ class NexoraWorkerApp(tk.Tk):
                             if cached.is_file():
                                 workload_zip = cached
 
-                        # Execute
-                        if run_task_engine:
-                            res, artifact_zip = run_task_engine(
-                                task["payload"], workload_archive=workload_zip
-                            )
-                        else:
-                            res, artifact_zip = run_task(task["payload"]), None
+                        # Execute with background heartbeat & lease renewal for long-running jobs
+                        stop_keepalive = threading.Event()
+
+                        def _keep_lease_alive() -> None:
+                            while not stop_keepalive.wait(20.0):
+                                try:
+                                    session.post(
+                                        f"{master_url}/api/v1/worker/nodes/{node_id}/heartbeat",
+                                        json=self._collect_metrics(),
+                                        timeout=5,
+                                    )
+                                    session.post(
+                                        f"{master_url}/api/v1/worker/tasks/{task_id}/renew",
+                                        json={"lease_token": lease_token},
+                                        timeout=5,
+                                    )
+                                except Exception:
+                                    pass
+
+                        keepalive_thread = threading.Thread(target=_keep_lease_alive, daemon=True)
+                        keepalive_thread.start()
+                        try:
+                            if run_task_engine:
+                                res, artifact_zip = run_task_engine(
+                                    task["payload"], workload_archive=workload_zip
+                                )
+                            else:
+                                res, artifact_zip = run_task(task["payload"]), None
+                        finally:
+                            stop_keepalive.set()
+                            keepalive_thread.join(timeout=2.0)
 
                         dur = round(time.time() - t0, 3)
 

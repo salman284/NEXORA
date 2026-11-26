@@ -339,6 +339,10 @@ class TaskResultRequest(BaseModel):
     error: str | None = Field(default=None, max_length=4000)
 
 
+class TaskRenewRequest(BaseModel):
+    lease_token: str = Field(min_length=20, max_length=256)
+
+
 class FinalResultResponse(BaseModel):
     job_id: str
     aggregation: str
@@ -828,13 +832,17 @@ def approve_node(cluster_id: str, node_id: str, user: CurrentUser) -> NodeRespon
     now = utc_now()
     with connection_scope() as db:
         require_master_cluster(db, cluster_id, user)
-        result = db.cluster_members.update_one(
-            {"cluster_id": cluster_id, "node_id": node_id, "status": "pending"},
-            {"$set": {"status": "approved", "approved_at": now, "revoked_at": None}},
-        )
-        if result.modified_count != 1:
+        existing = db.cluster_members.find_one({"cluster_id": cluster_id, "node_id": node_id})
+        if existing is None:
             raise HTTPException(status_code=404, detail="Pending node membership not found")
-        record_audit(db, user.id, "node.approved", "node", node_id, "success", {"cluster_id": cluster_id})
+        if existing.get("status") != "approved":
+            result = db.cluster_members.update_one(
+                {"cluster_id": cluster_id, "node_id": node_id, "status": "pending"},
+                {"$set": {"status": "approved", "approved_at": now, "revoked_at": None}},
+            )
+            if result.modified_count != 1:
+                raise HTTPException(status_code=404, detail="Pending node membership not found")
+            record_audit(db, user.id, "node.approved", "node", node_id, "success", {"cluster_id": cluster_id})
         node_doc = db.nodes.find_one({"node_id": node_id})
     return node_response(node_doc, "approved")
 
@@ -1474,6 +1482,36 @@ def lease_task(node_id: str, user: CurrentUser) -> TaskLeaseResponse | None:
         db.jobs.update_one({"job_id": selected["job_id"]}, {"$set": {"state": "running", "updated_at": now}})
         leased_doc = db.tasks.find_one({"task_id": selected["task_id"]})
     return TaskLeaseResponse(lease_token=lease_token, task=task_response(leased_doc, workload_id=selected["job"].get("workload_id")))
+
+
+@app.post("/api/v1/worker/tasks/{task_id}/renew", response_model=TaskResponse)
+def renew_task_lease(task_id: str, payload: TaskRenewRequest, user: CurrentUser) -> TaskResponse:
+    """Extend an active task lease while a long-running job is still computing."""
+    now = utc_now()
+    with connection_scope() as db:
+        task_docs = list(db.tasks.aggregate([
+            {"$match": {"task_id": task_id}},
+            {"$lookup": {"from": "jobs", "localField": "job_id", "foreignField": "job_id", "as": "job"}},
+            {"$unwind": "$job"},
+        ]))
+        if not task_docs:
+            raise HTTPException(status_code=404, detail="Task not found")
+        task_doc = task_docs[0]
+        require_worker_node(db, task_doc.get("assigned_node_id", ""), user)
+        lease_exp = task_doc.get("lease_expires_at")
+        if task_doc["state"] not in ("leased", "running") or (lease_exp and _parse_dt(lease_exp) <= now):
+            raise HTTPException(status_code=409, detail="Task lease is no longer active")
+        stored_hash = task_doc.get("lease_token_hash", "")
+        if not hmac.compare_digest(stored_hash, hash_token(payload.lease_token)):
+            raise HTTPException(status_code=409, detail="Invalid task lease token")
+        lease_seconds = max(30, int(task_doc["job"].get("lease_seconds", 60)))
+        new_expires = now + timedelta(seconds=lease_seconds)
+        db.tasks.update_one(
+            {"task_id": task_id},
+            {"$set": {"state": "running", "lease_expires_at": new_expires, "updated_at": now}},
+        )
+        updated = db.tasks.find_one({"task_id": task_id})
+    return task_response(updated, workload_id=task_doc["job"].get("workload_id"))
 
 
 @app.post("/api/v1/worker/tasks/{task_id}/result", response_model=TaskResponse)

@@ -51,6 +51,9 @@ class MasterClient:
     def lease_task(self, node_id: str) -> dict | None:
         return self._request("POST", f"/api/v1/worker/nodes/{node_id}/tasks/lease")
 
+    def renew_lease(self, task_id: str, lease_token: str) -> dict:
+        return self._request("POST", f"/api/v1/worker/tasks/{task_id}/renew", {"lease_token": lease_token})
+
     def submit_result(self, task_id: str, lease_token: str, result: dict | None = None, error: str | None = None) -> dict:
         status = "failed" if error else "succeeded"
         return self._request(

@@ -1789,16 +1789,16 @@ function Dashboard({ token, user, onLogout }: { token: string; user: User; onLog
         <div className="side-label">{isMaster ? "Master Workspace" : "Worker Station"}</div>
         {isMaster && (
           <>
-            <button className={`nav-item ${view === "overview" ? "active" : ""}`} onClick={() => setView("overview")}><Activity size={17} /> Overview</button>
-            <button className={`nav-item ${view === "workloads" ? "active" : ""}`} onClick={() => setView("workloads")}><Database size={17} /> Workloads & Jobs</button>
+            <button className={`nav-item ${view === "overview" ? "active" : ""}`} onClick={() => { setError(""); setView("overview"); }}><Activity size={17} /> Overview</button>
+            <button className={`nav-item ${view === "workloads" ? "active" : ""}`} onClick={() => { setError(""); setView("workloads"); }}><Database size={17} /> Workloads & Jobs</button>
           </>
         )}
-        <button className={`nav-item ${view === "worker" ? "active" : ""}`} onClick={() => setView("worker")}><Cpu size={17} /> Worker Console</button>
-        <button className={`nav-item ${view === "network" ? "active" : ""}`} onClick={() => setView("network")}><Network size={17} /> Network map</button>
+        <button className={`nav-item ${view === "worker" ? "active" : ""}`} onClick={() => { setError(""); setView("worker"); }}><Cpu size={17} /> Worker Console</button>
+        <button className={`nav-item ${view === "network" ? "active" : ""}`} onClick={() => { setError(""); setView("network"); }}><Network size={17} /> Network map</button>
         {isMaster && (
-          <button className={`nav-item ${view === "audit" ? "active" : ""}`} onClick={() => setView("audit")}><ShieldCheck size={17} /> Security log</button>
+          <button className={`nav-item ${view === "audit" ? "active" : ""}`} onClick={() => { setError(""); setView("audit"); }}><ShieldCheck size={17} /> Security log</button>
         )}
-        <button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={() => setView("settings")}><Settings size={17} /> Settings</button>
+        <button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={() => { setError(""); setView("settings"); }}><Settings size={17} /> Settings</button>
         <div className="sidebar-foot">
           <div className="user-chip">
             <div className="avatar">{user.full_name[0]}</div>
