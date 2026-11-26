@@ -175,12 +175,52 @@ def resolve_python_executable() -> str:
     return ""
 
 
-def _subprocess_env() -> dict[str, str]:
+def _subprocess_env(payload: Mapping[str, Any] | None = None) -> dict[str, str]:
     """Build clean non-interactive environment for worker script/notebook subprocesses."""
     env = os.environ.copy()
     env.setdefault("MPLBACKEND", "Agg")
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    if payload:
+        worker_idx = payload.get("worker_index")
+        total_workers = payload.get("total_workers")
+        if worker_idx is not None and total_workers is not None:
+            env["NEXORA_WORKER_INDEX"] = str(worker_idx)
+            env["NEXORA_TOTAL_WORKERS"] = str(total_workers)
+            env["NEXORA_SLICE"] = str(payload.get("slice", int(worker_idx) + 1))
+            env.setdefault("RANK", str(worker_idx))
+            env.setdefault("WORLD_SIZE", str(total_workers))
     return env
+
+
+_AUTO_SHARD_SOURCE = '''
+SHARD_CANDIDATES = (
+    "SEEDS", "TASKS", "EXPERIMENTS", "TRIALS",
+    "FOLDS", "CONFIGS", "RUNS", "ITEMS", "MODELS",
+)
+
+def _is_already_distributed(cells):
+    full_src = "\\n".join("".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code")
+    markers = ("task_input.json", "NEXORA_WORKER_INDEX", "WORLD_SIZE")
+    return any(m in full_src for m in markers)
+
+def _auto_shard_globals(ns, worker_idx, total_workers, state):
+    """Automatically shard the primary multi-run list variable across workers."""
+    if total_workers <= 1 or state.get("disabled"):
+        return
+    target = state.get("var")
+    candidates = (target,) if target else SHARD_CANDIDATES
+    for name in candidates:
+        val = ns.get(name)
+        if isinstance(val, (list, tuple)) and len(val) >= 2:
+            if id(val) == state.get("last_id"):
+                return
+            sharded = list(val)[worker_idx::total_workers]
+            ns[name] = tuple(sharded) if isinstance(val, tuple) else sharded
+            state["var"] = name
+            state["last_id"] = id(ns[name])
+            print(f"[NEXORA Auto-Shard] {name}: {len(val)} -> {len(sharded)} items for worker {worker_idx + 1}/{total_workers}: {sharded}")
+            return
+'''
 
 
 def _run_notebook_in_subprocess(
@@ -188,18 +228,24 @@ def _run_notebook_in_subprocess(
     notebook_path: Path,
     workspace_dir: Path,
     timeout_seconds: float,
+    payload: Mapping[str, Any] | None = None,
 ) -> tuple[str, Path]:
     """Execute a Jupyter notebook inside an external Python interpreter subprocess."""
     runner_code = (
         "import contextlib, io, json, os, sys\n"
         "from pathlib import Path\n"
-        "nb_path = Path(sys.argv[1])\n"
+        + _AUTO_SHARD_SOURCE
+        + "\nnb_path = Path(sys.argv[1])\n"
         "ws_dir = Path(sys.argv[2])\n"
         "nb_data = json.loads(nb_path.read_text(encoding='utf-8'))\n"
         "os.chdir(ws_dir)\n"
+        "worker_idx = int(os.environ.get('NEXORA_WORKER_INDEX', '0'))\n"
+        "total_workers = int(os.environ.get('NEXORA_TOTAL_WORKERS', '1'))\n"
+        "cells = nb_data.get('cells', [])\n"
+        "shard_state = {'disabled': _is_already_distributed(cells), 'var': None, 'last_id': None}\n"
         "run_globals = {'__name__': '__main__', '__file__': str(nb_path)}\n"
         "captures = []\n"
-        "for idx, cell in enumerate(nb_data.get('cells', [])):\n"
+        "for idx, cell in enumerate(cells):\n"
         "    if cell.get('cell_type') == 'code':\n"
         "        src = ''.join(cell.get('source', []))\n"
         "        if not src.strip():\n"
@@ -208,6 +254,7 @@ def _run_notebook_in_subprocess(
         "        try:\n"
         "            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):\n"
         "                exec(src, run_globals)\n"
+        "                _auto_shard_globals(run_globals, worker_idx, total_workers, shard_state)\n"
         "            out_text = buf.getvalue()\n"
         "            captures.append(out_text)\n"
         "            cell['outputs'] = [{'output_type': 'stream', 'name': 'stdout', 'text': [out_text]}]\n"
@@ -226,7 +273,7 @@ def _run_notebook_in_subprocess(
     proc = subprocess.run(
         [python_exe, str(runner_path), str(notebook_path), str(workspace_dir)],
         cwd=str(workspace_dir),
-        env=_subprocess_env(),
+        env=_subprocess_env(payload),
         capture_output=True,
         text=True,
         timeout=timeout_seconds,
@@ -321,7 +368,7 @@ def execute_script_or_notebook(
             proc = subprocess.run(
                 [python_exe, str(target_py)],
                 cwd=str(workspace_dir),
-                env=_subprocess_env(),
+                env=_subprocess_env(payload),
                 capture_output=True,
                 text=True,
                 timeout=effective_timeout,
@@ -332,7 +379,7 @@ def execute_script_or_notebook(
 
         def _run_nb_file(target_nb: Path) -> str:
             if python_exe:
-                out, _ = _run_notebook_in_subprocess(python_exe, target_nb, workspace_dir, effective_timeout)
+                out, _ = _run_notebook_in_subprocess(python_exe, target_nb, workspace_dir, effective_timeout, payload=payload)
                 return out
             out, _ = execute_notebook_cells(target_nb, workspace_dir)
             return out
