@@ -1056,6 +1056,7 @@ class NexoraWorkerApp(tk.Tk):
                                 workload_zip = cached
 
                         # Execute with background heartbeat & lease renewal for long-running jobs
+                        self.log(f"Executing workload '{task_key}' on host compute...", "info")
                         stop_keepalive = threading.Event()
 
                         def _keep_lease_alive() -> None:
@@ -1063,9 +1064,16 @@ class NexoraWorkerApp(tk.Tk):
                                 try:
                                     session.post(
                                         f"{master_url}/api/v1/worker/nodes/{node_id}/heartbeat",
-                                        json=self._collect_metrics(),
+                                        json={
+                                            "status": "online",
+                                            "cpu_utilization": psutil.cpu_percent(),
+                                            "ram_utilization": psutil.virtual_memory().percent,
+                                        },
                                         timeout=5,
                                     )
+                                except Exception:
+                                    pass
+                                try:
                                     session.post(
                                         f"{master_url}/api/v1/worker/tasks/{task_id}/renew",
                                         json={"lease_token": lease_token},
