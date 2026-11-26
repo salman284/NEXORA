@@ -1,9 +1,10 @@
 """
-NEXORA - Desktop Worker GUI Application v2.1
+NEXORA - Desktop Worker GUI Application v2.2
 Features:
   - Custom Branded AI Node Identity & Embedded Logo
   - Persistent Settings (save/load ~/.nexora_worker/config.json)
   - Real-Time Hardware Resource Gauges (CPU, RAM, GPU)
+  - Cross-vendor GPU monitoring: NVIDIA (GPUtil), AMD & Intel (WMI/PowerShell)
   - Live Compute Telemetry & Session Workload Metrics
   - Active Task Tracker with Sub-Second Elapsed Timer
   - Fault-Tolerant Auto-Reconnect Protocol (Exponential Backoff)
@@ -141,6 +142,7 @@ def save_config(data: dict) -> None:
 
 # ── Hardware Detection ─────────────────────────────────────────────────────
 def detect_hardware() -> dict[str, Any]:
+    """Detect all GPU hardware (NVIDIA, AMD, Intel) via WMI on Windows."""
     info: dict[str, Any] = {
         "hostname":     socket.gethostname(),
         "os":           f"{platform.system()} {platform.release()}",
@@ -150,6 +152,7 @@ def detect_hardware() -> dict[str, Any]:
         "gpu_model":    "None (CPU Compute)",
         "gpu_vendor":   None,
         "gpu_vram_gb":  0.0,
+        "gpu_list":     [],   # all detected GPUs
     }
     if platform.system() == "Windows":
         try:
@@ -158,21 +161,158 @@ def detect_hardware() -> dict[str, Any]:
                 'powershell -NoProfile -Command '
                 '"Get-CimInstance Win32_VideoController | '
                 'Select-Object -Property Name,AdapterCompatibility,AdapterRAM | '
-                'ConvertTo-Json"'
+                'ConvertTo-Json -Depth 3"'
             )
-            res = subprocess.run(cmd, capture_output=True, text=True, shell=True, timeout=5)
+            res = subprocess.run(cmd, capture_output=True, text=True, shell=True, timeout=6)
             if res.returncode == 0 and res.stdout.strip():
                 data = json.loads(res.stdout)
-                card = data[0] if isinstance(data, list) else data
-                name = card.get("Name")
-                if name:
-                    info["gpu_model"]   = name
-                    info["gpu_vendor"]  = card.get("AdapterCompatibility")
-                    vram = card.get("AdapterRAM") or 0
+                cards = data if isinstance(data, list) else [data]
+                # Filter out Microsoft Basic Display / software renderers
+                real_cards = [
+                    c for c in cards
+                    if c.get("Name") and "Microsoft" not in (c.get("Name") or "")
+                ]
+                if real_cards:
+                    # Pick primary card: prefer discrete (AMD/NVIDIA) over Intel iGPU
+                    primary = real_cards[0]
+                    for c in real_cards:
+                        vendor = (c.get("AdapterCompatibility") or "").lower()
+                        if "amd" in vendor or "nvidia" in vendor or "advanced" in vendor:
+                            primary = c
+                            break
+                    info["gpu_model"]  = primary.get("Name", "Unknown GPU")
+                    info["gpu_vendor"] = primary.get("AdapterCompatibility")
+                    vram = primary.get("AdapterRAM") or 0
                     info["gpu_vram_gb"] = round(vram / 1024 ** 3, 1) if vram else 0.0
+                    info["gpu_list"] = [
+                        {
+                            "name":   c.get("Name", "Unknown"),
+                            "vendor": c.get("AdapterCompatibility", ""),
+                            "vram_gb": round((c.get("AdapterRAM") or 0) / 1024 ** 3, 1),
+                        }
+                        for c in real_cards
+                    ]
         except Exception:
             pass
     return info
+
+
+# ── Cross-Vendor GPU Utilization ───────────────────────────────────────────
+class GpuMetrics:
+    """Thread-safe cache for GPU utilization polled in background."""
+    def __init__(self):
+        self._lock    = threading.Lock()
+        self.util_pct: float = 0.0
+        self.vram_used_mb: float = 0.0
+        self.vram_total_mb: float = 0.0
+        self.method: str = "none"
+
+    def update(self, util: float, vram_used: float, vram_total: float, method: str):
+        with self._lock:
+            self.util_pct      = util
+            self.vram_used_mb  = vram_used
+            self.vram_total_mb = vram_total
+            self.method        = method
+
+    def snapshot(self) -> tuple[float, float, float]:
+        with self._lock:
+            return self.util_pct, self.vram_used_mb, self.vram_total_mb
+
+
+_GPU_METRICS = GpuMetrics()
+
+
+def _query_gpu_utilization() -> None:
+    """
+    Background thread: queries GPU utilization every 4 seconds using multiple
+    methods in priority order:
+      1. NVIDIA – GPUtil (most accurate for NVIDIA)
+      2. AMD/Intel/NVIDIA – Windows GPU Engine Performance Counters (WMI)
+      3. AMD – pyadl if installed
+    Updates the global _GPU_METRICS cache.
+    """
+    import subprocess
+
+    while True:
+        util, vram_used, vram_total, method = 0.0, 0.0, 0.0, "none"
+
+        # ── Method 1: NVIDIA via GPUtil ──────────────────────────────────
+        try:
+            import GPUtil
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                g = gpus[0]
+                util       = g.load * 100
+                vram_used  = g.memoryUsed
+                vram_total = g.memoryTotal
+                method     = "gputil(nvidia)"
+                _GPU_METRICS.update(util, vram_used, vram_total, method)
+                time.sleep(4)
+                continue
+        except Exception:
+            pass
+
+        # ── Method 2: Windows GPU Engine Perf Counters (AMD/Intel/NVIDIA) ─
+        if platform.system() == "Windows":
+            try:
+                # Sum 3D engine utilization across all GPU adapters
+                ps = (
+                    'powershell -NoProfile -Command "'
+                    '$c = Get-Counter \'\\GPU Engine(*engtype_3D)\\Utilization Percentage\' '
+                    '-ErrorAction SilentlyContinue; '
+                    'if ($c) { ($c.CounterSamples | Measure-Object -Property CookedValue -Sum).Sum } '
+                    'else { -1 }"'
+                )
+                r = subprocess.run(ps, capture_output=True, text=True, shell=True, timeout=4)
+                if r.returncode == 0 and r.stdout.strip():
+                    val = float(r.stdout.strip())
+                    if val >= 0:
+                        util   = min(val, 100.0)
+                        method = "wmi(gpu-engine)"
+                        # Also try to get VRAM via AdapterRAM (static, already known)
+                        # For dynamic VRAM used, query dedicated video memory usage
+                        try:
+                            ps_vram = (
+                                'powershell -NoProfile -Command "'
+                                '$v = Get-CimInstance Win32_VideoController | '
+                                'Select-Object -First 1 -Property AdapterRAM; '
+                                '$v.AdapterRAM / 1MB"'
+                            )
+                            rv = subprocess.run(
+                                ps_vram, capture_output=True, text=True, shell=True, timeout=3
+                            )
+                            if rv.returncode == 0 and rv.stdout.strip():
+                                vram_total = float(rv.stdout.strip())
+                        except Exception:
+                            pass
+                        _GPU_METRICS.update(util, vram_used, vram_total, method)
+                        time.sleep(4)
+                        continue
+            except Exception:
+                pass
+
+        # ── Method 3: AMD via pyadl ──────────────────────────────────────
+        try:
+            import pyadl  # type: ignore
+            devs = pyadl.ADLManager.getInstance().getDevices()
+            if devs:
+                d    = devs[0]
+                util = float(d.getCurrentUsage() or 0)
+                method = "pyadl(amd)"
+                _GPU_METRICS.update(util, vram_used, vram_total, method)
+                time.sleep(4)
+                continue
+        except Exception:
+            pass
+
+        # No method worked — keep previous or zero
+        time.sleep(5)
+
+
+def _start_gpu_monitor_thread() -> None:
+    """Launch the background GPU polling thread (daemon, starts once)."""
+    t = threading.Thread(target=_query_gpu_utilization, daemon=True, name="nexora-gpu-mon")
+    t.start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -211,6 +351,7 @@ class NexoraWorkerApp(tk.Tk):
         self._apply_styles()
         self._build_ui()
         self._start_periodic_update()
+        _start_gpu_monitor_thread()   # cross-vendor GPU polling (NVIDIA/AMD/Intel)
 
         if HAS_TRAY:
             self._setup_tray()
@@ -357,14 +498,25 @@ class NexoraWorkerApp(tk.Tk):
         tk.Label(card, text="💻  DETECTED HARDWARE", font=("Segoe UI", 8, "bold"),
                  fg=C_BLUE, bg=C_CARD).pack(anchor=tk.W, pady=(0, 8))
 
-        has_gpu = self.hardware["gpu_vram_gb"] > 0
+        gpu_list = self.hardware.get("gpu_list", [])
+        has_gpu  = bool(gpu_list or self.hardware["gpu_vram_gb"] > 0)
+        # Build GPU display string: list all detected GPUs
+        if gpu_list:
+            gpu_str  = gpu_list[0]["name"]
+            vram_str = f" ({gpu_list[0]['vram_gb']} GB VRAM)" if gpu_list[0]["vram_gb"] > 0 else ""
+            if len(gpu_list) > 1:
+                extra = ", ".join(g["name"].split()[-1] for g in gpu_list[1:])
+                gpu_str += f" + {extra}"
+            gpu_display = gpu_str + vram_str
+        elif has_gpu:
+            gpu_display = f"{self.hardware['gpu_model']} ({self.hardware['gpu_vram_gb']} GB VRAM)"
+        else:
+            gpu_display = self.hardware["gpu_model"]
+
         rows = [
             ("CPU", f"{self.hardware['cpu_model']} ({self.hardware['cpu_threads']}T)", C_BLUE),
             ("RAM", f"{self.hardware['ram_total_gb']} GB total",                       C_BLUE),
-            ("GPU", (
-                f"{self.hardware['gpu_model']} ({self.hardware['gpu_vram_gb']} GB VRAM)"
-                if has_gpu else self.hardware["gpu_model"]
-            ), C_LIME if has_gpu else C_SUB),
+            ("GPU", gpu_display, C_LIME if has_gpu else C_SUB),
             ("OS",  self.hardware["os"],                                                C_SUB),
         ]
         for lbl, val, color in rows:
@@ -387,11 +539,18 @@ class NexoraWorkerApp(tk.Tk):
         self.cpu_bar = self._gauge_row(card, "CPU", "CPU.Horizontal.TProgressbar")
         self.ram_bar = self._gauge_row(card, "RAM", "RAM.Horizontal.TProgressbar")
 
-        has_gpu = self.hardware["gpu_vram_gb"] > 0
+        # Show GPU gauge for ANY vendor (NVIDIA / AMD / Intel)
+        has_gpu = bool(self.hardware.get("gpu_list") or self.hardware["gpu_vram_gb"] > 0)
         if has_gpu:
             self.gpu_bar = self._gauge_row(card, "GPU", "GPU.Horizontal.TProgressbar")
+            self._gpu_method_lbl = tk.Label(
+                card, text="GPU monitor: initializing…",
+                font=("Segoe UI", 7), fg=C_SUB, bg=C_CARD,
+            )
+            self._gpu_method_lbl.pack(anchor=tk.W)
         else:
             self.gpu_bar = None
+            self._gpu_method_lbl = None
             tk.Label(card, text="GPU: Not detected (CPU compute mode)",
                      font=("Segoe UI", 8), fg=C_SUB, bg=C_CARD).pack(anchor=tk.W, pady=3)
 
@@ -609,19 +768,29 @@ class NexoraWorkerApp(tk.Tk):
             text=f"{mem.percent:.0f}%  ({used_gb:.1f}/{self.hardware['ram_total_gb']}GB)"
         )
 
-        # GPU
+        # GPU — reads from background cross-vendor monitor (_GPU_METRICS cache)
         if self.gpu_bar:
-            try:
-                import GPUtil
-                gpus = GPUtil.getGPUs()
-                if gpus:
-                    g = gpus[0]
-                    self.gpu_bar["value"] = g.load * 100
-                    self.gpu_bar._pct_label.config(
-                        text=f"{g.load * 100:.0f}%  ({g.memoryUsed:.0f}/{g.memoryTotal:.0f}MB)"
-                    )
-            except Exception:
-                pass
+            util, vram_used, vram_total = _GPU_METRICS.snapshot()
+            self.gpu_bar["value"] = util
+            if vram_total > 0:
+                pct_txt = f"{util:.0f}%  ({vram_used:.0f}/{vram_total:.0f} MB)"
+            else:
+                pct_txt = f"{util:.0f}%"
+            self.gpu_bar._pct_label.config(text=pct_txt)
+            # Update small vendor/method label
+            if self._gpu_method_lbl:
+                method = _GPU_METRICS.method
+                vendor_name = self.hardware.get("gpu_vendor") or "GPU"
+                badge = {
+                    "gputil(nvidia)": f"📡 NVIDIA · via GPUtil",
+                    "wmi(gpu-engine)": f"📡 {vendor_name} · via WMI",
+                    "pyadl(amd)":      f"📡 AMD · via pyadl",
+                    "none":            "⏳ Detecting GPU monitor…",
+                }.get(method, f"📡 {method}")
+                self.gpu_bar._pct_label.config(
+                    fg=C_LIME if util > 5 else C_TEXT
+                )
+                self._gpu_method_lbl.config(text=badge)
 
         # Session uptime
         elapsed = int(time.time() - self._session_start)
