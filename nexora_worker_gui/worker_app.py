@@ -163,7 +163,14 @@ def detect_hardware() -> dict[str, Any]:
                 'Select-Object -Property Name,AdapterCompatibility,AdapterRAM | '
                 'ConvertTo-Json -Depth 3"'
             )
-            res = subprocess.run(cmd, capture_output=True, text=True, shell=True, timeout=6)
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                shell=True,
+                timeout=6,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
             if res.returncode == 0 and res.stdout.strip():
                 data = json.loads(res.stdout)
                 cards = data if isinstance(data, list) else [data]
@@ -255,31 +262,32 @@ def _query_gpu_utilization() -> None:
         # ── Method 2: Windows GPU Engine Perf Counters (AMD/Intel/NVIDIA) ─
         if platform.system() == "Windows":
             try:
-                # Sum 3D engine utilization across all GPU adapters
+                no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                # Sum 3D + Compute engine utilization across GPU adapters (covers OpenCL & 3D)
                 ps = (
                     'powershell -NoProfile -Command "'
-                    '$c = Get-Counter \'\\GPU Engine(*engtype_3D)\\Utilization Percentage\' '
+                    '$c = Get-Counter \'\\GPU Engine(*)\\Utilization Percentage\' '
                     '-ErrorAction SilentlyContinue; '
-                    'if ($c) { ($c.CounterSamples | Measure-Object -Property CookedValue -Sum).Sum } '
+                    'if ($c) { ($c.CounterSamples | Where-Object { $_.InstanceName -match \'engtype_3D|engtype_Compute\' } '
+                    '| Measure-Object -Property CookedValue -Sum).Sum } '
                     'else { -1 }"'
                 )
-                r = subprocess.run(ps, capture_output=True, text=True, shell=True, timeout=4)
+                r = subprocess.run(ps, capture_output=True, text=True, shell=True, timeout=4, creationflags=no_win)
                 if r.returncode == 0 and r.stdout.strip():
                     val = float(r.stdout.strip())
                     if val >= 0:
                         util   = min(val, 100.0)
                         method = "wmi(gpu-engine)"
-                        # Also try to get VRAM via AdapterRAM (static, already known)
-                        # For dynamic VRAM used, query dedicated video memory usage
                         try:
                             ps_vram = (
                                 'powershell -NoProfile -Command "'
                                 '$v = Get-CimInstance Win32_VideoController | '
+                                'Where-Object { $_.Name -notmatch \'Microsoft\' } | '
                                 'Select-Object -First 1 -Property AdapterRAM; '
                                 '$v.AdapterRAM / 1MB"'
                             )
                             rv = subprocess.run(
-                                ps_vram, capture_output=True, text=True, shell=True, timeout=3
+                                ps_vram, capture_output=True, text=True, shell=True, timeout=3, creationflags=no_win
                             )
                             if rv.returncode == 0 and rv.stdout.strip():
                                 vram_total = float(rv.stdout.strip())
@@ -1127,11 +1135,7 @@ class NexoraWorkerApp(tk.Tk):
             try:
                 hb = session.post(
                     f"{master_url}/api/v1/worker/nodes/{node_id}/heartbeat",
-                    json={
-                        "status": "online",
-                        "cpu_utilization": psutil.cpu_percent(),
-                        "ram_utilization": psutil.virtual_memory().percent,
-                    },
+                    json=self._build_heartbeat_payload(),
                     timeout=5,
                 )
                 if hb.status_code == 200:
@@ -1160,11 +1164,7 @@ class NexoraWorkerApp(tk.Tk):
                 try:
                     session.post(
                         f"{master_url}/api/v1/worker/nodes/{node_id}/heartbeat",
-                        json={
-                            "status": "online",
-                            "cpu_utilization": psutil.cpu_percent(),
-                            "ram_utilization": psutil.virtual_memory().percent,
-                        },
+                        json=self._build_heartbeat_payload(),
                         timeout=5,
                     )
                     last_hb = now
@@ -1233,11 +1233,7 @@ class NexoraWorkerApp(tk.Tk):
                                 try:
                                     session.post(
                                         f"{master_url}/api/v1/worker/nodes/{node_id}/heartbeat",
-                                        json={
-                                            "status": "online",
-                                            "cpu_utilization": psutil.cpu_percent(),
-                                            "ram_utilization": psutil.virtual_memory().percent,
-                                        },
+                                        json=self._build_heartbeat_payload(),
                                         timeout=5,
                                     )
                                 except Exception:
@@ -1315,6 +1311,22 @@ class NexoraWorkerApp(tk.Tk):
             time.sleep(1.0)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+    def _build_heartbeat_payload(self) -> dict[str, Any]:
+        """Build worker heartbeat payload including cross-vendor GPU telemetry."""
+        payload: dict[str, Any] = {
+            "status": "online",
+            "cpu_utilization": psutil.cpu_percent(),
+            "ram_utilization": psutil.virtual_memory().percent,
+            "telemetry_source": _GPU_METRICS.method if _GPU_METRICS.method != "none" else "worker_agent",
+        }
+        has_gpu = bool(self.hardware.get("gpu_list") or self.hardware.get("gpu_vram_gb", 0) > 0)
+        if has_gpu:
+            util, vram_used_mb, _ = _GPU_METRICS.snapshot()
+            payload["gpu_utilization"] = round(min(max(util, 0.0), 100.0), 1)
+            if vram_used_mb > 0:
+                payload["gpu_used_vram_bytes"] = int(vram_used_mb * 1024 * 1024)
+        return payload
+
     @staticmethod
     def _add_padding(frame: tk.Frame, px: int = 14, py: int = 12):
         frame.config(padx=px, pady=py)
